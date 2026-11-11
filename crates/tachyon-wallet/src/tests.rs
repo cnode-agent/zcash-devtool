@@ -10,8 +10,10 @@ use zcash_tachyon::{
     constants::EPOCH_SIZE, keys::private::SpendingKey,
 };
 
+use oss_core::TachyonStamp as Stamp;
+
 use crate::{
-    chain::{self, Block, Stamp},
+    chain::{self, Block},
     control::Control,
     note::{self, Receipt},
     transaction::{self, FEE, Funding, Payment},
@@ -88,7 +90,7 @@ pub(crate) fn mine(blocks: &mut Vec<Block>, tx: Option<&Transaction>) -> Result<
         stamps,
         transactions: tx.map(|t| vec![t.txid().to_string()]).unwrap_or_default(),
     };
-    block.validate(Some(parent), 8)?;
+    chain::validate(&block, Some(parent), 8)?;
     blocks.push(block);
     Ok(())
 }
@@ -237,26 +239,26 @@ fn receipts_are_canonical_and_bound_to_owner_and_network() -> Result<()> {
 #[test]
 fn chain_rejects_corrupt_inputs_and_discontinuities() -> Result<()> {
     let mut blocks = vec![genesis()];
-    blocks[0].validate(None, 8)?;
+    chain::validate(&blocks[0], None, 8)?;
     let tx = shield(&blocks, &own(1_000_000))?;
     mine(&mut blocks, Some(&tx))?;
     let mut bad = blocks[1].clone();
     bad.stamps[0].tachygrams.pop();
-    assert!(bad.validate(Some(&blocks[0]), 8).is_err());
+    assert!(chain::validate(&bad, Some(&blocks[0]), 8).is_err());
     let mut bad = blocks[1].clone();
     bad.previous_block_hash = hex::encode([9; 32]);
-    assert!(bad.validate(Some(&blocks[0]), 8).is_err());
+    assert!(chain::validate(&bad, Some(&blocks[0]), 8).is_err());
     let mut bad = blocks[1].clone();
     bad.epoch_start_anchor = Some(bad.anchor_before.clone());
-    assert!(bad.validate(Some(&blocks[0]), 8).is_err());
+    assert!(chain::validate(&bad, Some(&blocks[0]), 8).is_err());
     let mut bad = blocks[1].clone();
     bad.epoch_length /= 2;
-    assert!(bad.validate(Some(&blocks[0]), 8).is_err());
+    assert!(chain::validate(&bad, Some(&blocks[0]), 8).is_err());
     let mut bad = blocks[1].clone();
     // Reject before constructing a polynomial, including under mock Ragu.
     bad.stamps[0].tachygrams = vec![hex::encode([0; 32]); chain::max_polynomial_members() + 1];
     assert!(
-        bad.validate(Some(&blocks[0]), 8)
+        chain::validate(&bad, Some(&blocks[0]), 8)
             .unwrap_err()
             .to_string()
             .contains("polynomial capacity")
@@ -359,8 +361,8 @@ fn checkpoint_history_supports_spends_before_and_after_creation_epoch_closes() -
         mine(&mut blocks, None)?;
     }
     let checkpoint = blocks.last().unwrap().clone();
-    checkpoint.validate_checkpoint(8)?;
-    assert!(checkpoint.validate(None, 8).is_err());
+    chain::validate_checkpoint(&checkpoint, 8)?;
+    assert!(chain::validate(&checkpoint, None, 8).is_err());
     blocks = vec![checkpoint]; // No public data from epoch zero is needed.
     let receipt = own(1_000_000);
     let tx = shield(&blocks, &receipt)?;
@@ -425,7 +427,7 @@ fn populate_epoch(blocks: &mut Vec<Block>, count: usize) -> Result<()> {
         });
     }
     block.anchor_after = chain::anchor_hex(anchor);
-    block.validate(Some(&blocks[parent_index]), 8)?;
+    chain::validate(&block, Some(&blocks[parent_index]), 8)?;
     *blocks.last_mut().unwrap() = block;
     Ok(())
 }

@@ -1,7 +1,11 @@
 //! Birthday checkpoints and bounded backfills of contiguous public evidence.
 
 use super::*;
-use crate::{chain::Block, note::Locator, rpc::RpcError};
+use crate::{
+    chain::{self, Block},
+    note::Locator,
+    rpc::RpcError,
+};
 
 pub(super) fn epoch_start(height: u32, activation: u32) -> Result<u32> {
     let offset = height
@@ -15,7 +19,7 @@ pub(super) fn checkpoint(rpc: &Rpc, height: u32, activation: u32) -> Result<Bloc
         "Loading trusted epoch checkpoint at height {height}…"
     ))?;
     let block = fetch_block(rpc, height)?;
-    block.validate_checkpoint(activation)?;
+    chain::validate_checkpoint(&block, activation)?;
     ensure!(
         rpc.hash(height)? == block.hash,
         "checkpoint changed during initialization; retry"
@@ -63,7 +67,7 @@ impl SyncCache {
         if self.validated.contains(&key) {
             return Ok(());
         }
-        block.validate(previous, activation)?;
+        chain::validate(block, previous, activation)?;
         self.validated.insert(key);
         self.validations += 1;
         Ok(())

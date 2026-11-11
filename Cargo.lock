@@ -4766,6 +4766,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "oss-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "ragu",
+ "ragu_circuits",
+ "ragu_core",
+ "ragu_primitives",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "zakura-pasta-curves 1.2.0",
+ "zakura-udon",
+ "zcash_tachyon",
+]
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7336,6 +7354,7 @@ dependencies = [
  "clap",
  "ff 0.14.0",
  "hex",
+ "oss-core",
  "ragu",
  "ragu_circuits",
  "ragu_core",

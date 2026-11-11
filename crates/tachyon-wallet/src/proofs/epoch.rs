@@ -333,9 +333,9 @@ impl Epoch {
             // Validate complete contiguous coverage, including the closing
             // sentinel. A partial epoch must never be sealed as complete.
             if previous.is_none() {
-                block.validate_checkpoint(first.activation_height)?;
+                crate::chain::validate_checkpoint(block, first.activation_height)?;
             } else {
-                block.validate(previous, first.activation_height)?;
+                crate::chain::validate(block, previous, first.activation_height)?;
             }
             previous = Some(block);
             hash.update(serde_json::to_vec(block)?);
