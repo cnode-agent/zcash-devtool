@@ -47,6 +47,10 @@ pub struct Command {
 
 #[derive(Debug, Subcommand)]
 enum Operation {
+    /// Finalize every closed-epoch routing profile in the shared evidence cache.
+    PrewarmEpochs,
+    /// Read the shared evidence invalidation generation without proving.
+    EvidenceGeneration,
     /// Create a mock-proof wallet for a private development network. Keys are NOT encrypted.
     Init {
         #[arg(long)]
@@ -262,6 +266,18 @@ impl Command {
             return Ok(result);
         }
         control.stage("Opening wallet database…")?;
+        if matches!(
+            self.command,
+            Operation::PrewarmEpochs | Operation::EvidenceGeneration
+        ) {
+            let store = Store::open_for_prewarm(&self.wallet_dir)?;
+            if matches!(self.command, Operation::EvidenceGeneration) {
+                store.check_evidence_identity(&store.config()?)?;
+                return Ok(json!({"generation":store.evidence_cache()?.generation()?,
+                    "namespace":crate::evidence::namespace(&store.config()?.network_id)}));
+            }
+            return crate::proofs::prewarm(&store, control);
+        }
         let read_only = matches!(
             self.command,
             Operation::BalanceSummary
@@ -276,7 +292,9 @@ impl Command {
         let config = store.config()?;
         let key = SpendingKey::from(config.seed);
         let result = match self.command {
-            Operation::Init { .. } => unreachable!("init returned above"),
+            Operation::Init { .. } | Operation::PrewarmEpochs | Operation::EvidenceGeneration => {
+                unreachable!("handled above")
+            }
             Operation::Address => addresses(&config)?,
             operation @ (Operation::Balance | Operation::BalanceSummary) => {
                 let summary = matches!(operation, Operation::BalanceSummary);

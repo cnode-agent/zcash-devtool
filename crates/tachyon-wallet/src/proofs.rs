@@ -13,7 +13,11 @@ use zcash_tachyon::{
     witness,
 };
 
-use crate::{chain::{anchor, anchor_hex}, control::Control, store::ChainData};
+use crate::{
+    chain::{anchor, anchor_hex},
+    control::Control,
+    store::ChainData,
+};
 use udon::field::Field;
 use zcash_tachyon::pasta::Fp;
 
@@ -22,6 +26,7 @@ type ProofStamp = zcash_tachyon::ProofStamp<zcash_tachyon::stamp::Uncompressed>;
 
 mod epoch;
 use epoch::bucket;
+pub(crate) use epoch::prewarm;
 
 fn trivial() -> Pcd<()> {
     PROOF_SYSTEM.bootstrap_proof().clone().carry(())

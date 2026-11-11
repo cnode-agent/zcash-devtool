@@ -195,23 +195,21 @@ pub fn build(payment: Payment<'_>, control: &Control) -> Result<Transaction> {
         control,
     )?;
     control.stage("Signing transaction…")?;
-    let placeholder = TachyonBundle::Proven(
-        {
-            let bundle = plan
-                .clone()
-                .sign(&mut rng, &[0; 32], &key.derive_auth_private())?
-                .stamp(stamp.clone());
-            let stamp = bundle.stamp.compress(&mut rng)?;
-            zcash_tachyon::Bundle {
-                actions: bundle.actions,
-                value_balance: bundle.value_balance,
-                cv_feemax: bundle.cv_feemax,
-                binding_sig: bundle.binding_sig,
-                memo: bundle.memo,
-                stamp,
-            }
-        },
-    );
+    let placeholder = TachyonBundle::Proven({
+        let bundle = plan
+            .clone()
+            .sign(&mut rng, &[0; 32], &key.derive_auth_private())?
+            .stamp(stamp.clone());
+        let stamp = bundle.stamp.compress(&mut rng)?;
+        zcash_tachyon::Bundle {
+            actions: bundle.actions,
+            value_balance: bundle.value_balance,
+            cv_feemax: bundle.cv_feemax,
+            binding_sig: bundle.binding_sig,
+            memo: bundle.memo,
+            stamp,
+        }
+    });
     let vout = transparent_output
         .map(|(address, amount)| -> Result<_> {
             Ok(TxOut::new(

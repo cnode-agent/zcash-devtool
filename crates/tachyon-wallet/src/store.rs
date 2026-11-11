@@ -48,6 +48,8 @@ pub struct StoredOperation {
 pub struct Store {
     conn: Connection,
     evidence: Option<Connection>,
+    evidence_path: Option<PathBuf>,
+    invalidate_after_commit: std::cell::Cell<bool>,
 }
 
 /// Chain evidence access for proofs: tests may use an in-memory slice, while
@@ -160,19 +162,6 @@ impl ChainData<'_> {
         }
     }
 
-    pub fn put_bucket_proof(
-        &self,
-        epoch: u32,
-        profile: QrProfile,
-        pcd: &[u8],
-        members: &[u8],
-    ) -> Result<()> {
-        match self {
-            Self::Blocks(_) => Ok(()),
-            Self::Store(store) => store.put_bucket_proof(epoch, profile, pcd, members),
-        }
-    }
-
     pub fn epoch_node(
         &self,
         epoch: u32,
@@ -242,12 +231,34 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 impl Store {
     pub fn open(dir: &Path, initialize: bool) -> Result<Self> {
-        Self::open_with_mode(dir, initialize, false)
+        Self::open_with_mode(dir, initialize, false, true)
     }
     pub fn open_readonly(dir: &Path) -> Result<Self> {
-        Self::open_with_mode(dir, false, true)
+        Self::open_with_mode(dir, false, true, false)
     }
-    fn open_with_mode(dir: &Path, initialize: bool, read_only: bool) -> Result<Self> {
+    /// Public evidence may be populated without taking the wallet writer lock.
+    pub fn open_for_prewarm(dir: &Path) -> Result<Self> {
+        Self::open_with_mode(dir, false, true, true)
+    }
+    #[cfg(test)]
+    pub(crate) fn use_evidence_copy(&mut self, path: &Path) -> Result<()> {
+        self.evidence = Some(Connection::open(path)?);
+        self.evidence_path = Some(path.into());
+        Ok(())
+    }
+    pub fn evidence_cache(&self) -> Result<crate::evidence::Cache> {
+        crate::evidence::Cache::open(
+            self.evidence_path
+                .as_deref()
+                .context("evidence cache is read-only")?,
+        )
+    }
+    fn open_with_mode(
+        dir: &Path,
+        initialize: bool,
+        read_only: bool,
+        with_evidence: bool,
+    ) -> Result<Self> {
         if initialize && !dir.exists() {
             #[cfg(unix)]
             {
@@ -303,21 +314,24 @@ impl Store {
                 CREATE TABLE pending (txid TEXT PRIMARY KEY, data TEXT NOT NULL);",
             )?;
         }
-        let evidence = if read_only {
-            None
-        } else if let Some(directory) = std::env::var_os("TACHYON_EVIDENCE_DIR") {
-            let directory = PathBuf::from(directory);
+        let evidence_path = with_evidence.then(|| {
+            std::env::var_os("TACHYON_EVIDENCE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| dir.join(".evidence"))
+                .join("evidence.sqlite")
+        });
+        let evidence = if let Some(path) = &evidence_path {
+            let directory = path.parent().context("invalid evidence path")?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt;
                 fs::DirBuilder::new()
                     .recursive(true)
                     .mode(0o700)
-                    .create(&directory)?;
+                    .create(directory)?;
             }
             #[cfg(not(unix))]
             fs::create_dir_all(&directory)?;
-            let path = directory.join("evidence.sqlite");
             let evidence = Connection::open(path)?;
             evidence.busy_timeout(Duration::from_secs(300))?;
             evidence.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
@@ -325,7 +339,12 @@ impl Store {
         } else {
             None
         };
-        let store = Self { conn, evidence };
+        let store = Self {
+            conn,
+            evidence,
+            evidence_path,
+            invalidate_after_commit: std::cell::Cell::new(false),
+        };
         if !read_only {
             store.ensure_pending_meta()?;
         }
@@ -373,7 +392,13 @@ impl Store {
         Ok(())
     }
     pub fn commit(&self) -> Result<()> {
-        Ok(self.conn.execute_batch("COMMIT")?)
+        self.conn.execute_batch("COMMIT")?;
+        if self.invalidate_after_commit.replace(false) {
+            // A read-only prewarmer could have observed the old wallet history
+            // between rewind and COMMIT. Fence that interval's builders too.
+            self.evidence_cache()?.invalidate()?;
+        }
+        Ok(())
     }
     pub fn set_config(&self, config: &Config) -> Result<()> {
         self.conn.execute(
@@ -398,24 +423,19 @@ impl Store {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         )?;
-        let cached: Option<String> = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key='network_id'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(cached) = cached {
-            ensure!(
-                cached == config.network_id,
-                "shared evidence belongs to a different network; use a fresh evidence directory"
-            );
-        } else {
-            conn.execute(
-                "INSERT OR IGNORE INTO metadata VALUES('network_id', ?)",
-                [&config.network_id],
-            )?;
-        }
+        conn.execute(
+            "INSERT OR IGNORE INTO metadata VALUES('network_id', ?)",
+            [&config.network_id],
+        )?;
+        let cached: String = conn.query_row(
+            "SELECT value FROM metadata WHERE key='network_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            cached == config.network_id,
+            "shared evidence belongs to a different network; use a fresh evidence directory"
+        );
         Ok(())
     }
     pub fn network_identity_valid(&self, config: &Config) -> Result<bool> {
@@ -629,6 +649,8 @@ impl Store {
         Ok(())
     }
     fn clear_shared_epoch_proofs(&self) -> Result<()> {
+        self.invalidate_after_commit.set(true);
+        self.evidence_cache()?.invalidate()?;
         self.ensure_evidence_tables()?;
         let conn = self.evidence_conn();
         conn.execute("DELETE FROM epoch_proofs", [])?;
@@ -641,29 +663,19 @@ impl Store {
         profile: QrProfile,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         self.ensure_evidence_tables()?;
-        self.evidence_conn()
-            .query_row(
-                "SELECT pcd, members FROM epoch_proofs WHERE epoch=? AND depth=? AND bits=?",
-                params![epoch, profile.depth, profile.bits],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-    pub fn put_bucket_proof(
-        &self,
-        epoch: u32,
-        profile: QrProfile,
-        pcd: &[u8],
-        members: &[u8],
-    ) -> Result<()> {
-        self.ensure_evidence_tables()?;
-        self.evidence_conn().execute(
-            "INSERT INTO epoch_proofs VALUES(?, ?, ?, ?, ?)
-             ON CONFLICT(epoch, depth, bits) DO UPDATE SET pcd=excluded.pcd, members=excluded.members",
-            params![epoch, profile.depth, profile.bits, pcd, members],
-        )?;
-        Ok(())
+        let sql = "SELECT pcd,members FROM epoch_proofs WHERE epoch=? AND depth=? AND bits=?";
+        let values = params![epoch, profile.depth, profile.bits];
+        let read = |conn: &Connection| {
+            conn.query_row(sql, values, |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+        };
+        let value = read(self.evidence_conn())?;
+        if value.is_some() || !self.table_exists("epoch_proofs")? {
+            return Ok(value);
+        }
+        // Older standalone wallets stored public evidence inside the wallet.
+        // Read it in place; promotion still requires full proof validation.
+        Ok(read(&self.conn)?)
     }
     pub fn epoch_node(
         &self,
@@ -674,15 +686,17 @@ impl Store {
         profile: QrProfile,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         self.ensure_evidence_tables()?;
-        self.evidence_conn()
-            .query_row(
-                "SELECT pcd, members FROM epoch_nodes
-                 WHERE epoch=? AND kind=? AND first=? AND last=? AND depth=? AND bits=?",
-                params![epoch, kind, first, last, profile.depth, profile.bits],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()
-            .map_err(Into::into)
+        let sql = "SELECT pcd,members FROM epoch_nodes WHERE epoch=? AND kind=? AND first=? AND last=? AND depth=? AND bits=?";
+        let values = params![epoch, kind, first, last, profile.depth, profile.bits];
+        let read = |conn: &Connection| {
+            conn.query_row(sql, values, |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+        };
+        let value = read(self.evidence_conn())?;
+        if value.is_some() || !self.table_exists("epoch_nodes")? {
+            return Ok(value);
+        }
+        Ok(read(&self.conn)?)
     }
     #[expect(
         clippy::too_many_arguments,

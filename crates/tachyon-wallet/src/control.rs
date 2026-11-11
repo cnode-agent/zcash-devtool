@@ -147,7 +147,7 @@ impl Control {
         Self::with_timing(quiet, std::env::var_os("TACHYON_TIMING").is_some())
     }
 
-    fn with_timing(quiet: bool, timing: bool) -> Self {
+    pub(crate) fn with_timing(quiet: bool, timing: bool) -> Self {
         Self {
             cancellation: CancellationToken::new(),
             quiet,
@@ -158,6 +158,21 @@ impl Control {
             })),
             timing: timing.then(|| Arc::new(Mutex::new(Timing::new()))),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_counts(&self, kind: &str) -> (u64, u64) {
+        self.timing
+            .as_ref()
+            .and_then(|timing| {
+                timing
+                    .lock()
+                    .unwrap()
+                    .cache
+                    .get(kind)
+                    .map(|sample| (sample.hits, sample.misses))
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn check(&self) -> Result<()> {
