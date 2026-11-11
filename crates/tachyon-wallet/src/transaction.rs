@@ -18,11 +18,17 @@ use transparent::{
     sighash::{SighashType, TransparentAuthorizingContext},
 };
 use zcash_tachyon::{
-    Note, TachyonBundle, action, bundle::Plan, entropy::ActionEntropy, fee,
-    keys::private::SpendingKey, note::CommitmentTrapdoor, nullifier, value,
+    Note, TachyonBundle, action, bundle::Plan, entropy::ActionEntropy, keys::private::SpendingKey,
+    note::CommitmentTrapdoor, nullifier, value,
 };
 
-use crate::{chain::anchor, control::Control, note::Receipt, proofs, store::ChainData};
+use crate::{
+    chain::anchor,
+    control::Control,
+    note::Receipt,
+    proofs::{self, Prover},
+    store::ChainData,
+};
 
 pub const FEE: u64 = 50_000;
 
@@ -131,28 +137,25 @@ pub fn build(payment: Payment<'_>, control: &Control) -> Result<Transaction> {
     );
     let key = SpendingKey::from(seed);
     let mut rng = rand::rng();
-    let mut evidence = Vec::new();
-    let mut plan_anchor = anchor(&tip.anchor_after)?;
-    let multiple_spends = spends.len() > 1;
+    let prover = Prover::Local(&blocks);
     let mut prepared = Vec::with_capacity(spends.len());
     for receipt in spends {
         let note = receipt.note()?;
-        let spendable = proofs::spendable(&blocks, &key, note, control)?;
+        let spendable = proofs::spendable(&blocks, &prover, &key, note, control)?;
         let secret = proofs::secret(&key, note, control)?;
         prepared.push((note, secret, spendable));
     }
-    if prepared.len() == 1 {
-        plan_anchor = prepared[0].2.data().2;
-    } else if multiple_spends {
-        plan_anchor = anchor(&tip.anchor_after)?;
-    }
+    // One spans request for every spend, so all of them lift to one target.
+    let (plan_anchor, chunks, start) = if prepared.is_empty() {
+        (anchor(&tip.anchor_after)?, Vec::new(), Vec::new())
+    } else {
+        let from: Vec<_> = prepared.iter().map(|(_, _, s)| s.data().2).collect();
+        prover.spans(&from, control)?
+    };
+    let mut evidence = Vec::with_capacity(prepared.len());
     let mut spends = Vec::with_capacity(prepared.len());
-    for (note, secret, spendable) in prepared {
-        let spans = if multiple_spends {
-            proofs::anchor_spans(&blocks, spendable.data().2, plan_anchor, control)?
-        } else {
-            Vec::new()
-        };
+    for ((note, secret, spendable), start) in prepared.into_iter().zip(start) {
+        let spans = start.map_or_else(Vec::new, |s| chunks[s..].to_vec());
         spends.push(action::Plan::spend(
             note,
             ActionEntropy::random(&mut rng),
@@ -183,17 +186,6 @@ pub fn build(payment: Payment<'_>, control: &Control) -> Result<Transaction> {
         .clone()
         .stamp_plan(plan_anchor, value::Positive::try_from(FEE)?)
         .prove(&mut rng, &key.derive_proof_private(), evidence)?;
-    let fee_descriptors = std::collections::BTreeSet::from([fee::Descriptor {
-        cv_feemax: max_fee_note.cv_feemax(),
-        v_fee: value::Positive::try_from(FEE)?,
-    }]);
-    let stamp = proofs::lift_stamp(
-        &blocks,
-        stamp,
-        &plan.descriptors(),
-        &fee_descriptors,
-        control,
-    )?;
     control.stage("Signing transaction…")?;
     let placeholder = TachyonBundle::Proven({
         let bundle = plan

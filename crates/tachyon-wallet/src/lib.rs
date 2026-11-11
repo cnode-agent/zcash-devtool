@@ -5,7 +5,6 @@ compile_error!("Tachyon requires RUSTFLAGS='--cfg zcash_unstable=\"nutachyon\"'"
 
 mod chain;
 mod control;
-mod evidence;
 mod funding_balance;
 mod note;
 mod proofs;

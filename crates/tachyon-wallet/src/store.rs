@@ -47,9 +47,6 @@ pub struct StoredOperation {
 
 pub struct Store {
     conn: Connection,
-    evidence: Option<Connection>,
-    evidence_path: Option<PathBuf>,
-    invalidate_after_commit: std::cell::Cell<bool>,
 }
 
 /// Chain evidence access for proofs: tests may use an in-memory slice, while
@@ -105,13 +102,17 @@ impl ChainData<'_> {
                 .cloned()
                 .collect()),
             Self::Store(store) => {
-                let activation = self.tip()?.activation_height;
-                let start = activation
-                    .checked_add(epoch.checked_mul(EPOCH_SIZE).context("epoch overflow")?)
-                    .context("epoch height overflow")?;
+                let start = self.epoch_start(epoch)?;
                 store.blocks_range(start, start.saturating_add(EPOCH_SIZE))
             }
         }
+    }
+
+    fn epoch_start(&self, epoch: u32) -> Result<u32> {
+        self.tip()?
+            .activation_height
+            .checked_add(epoch.checked_mul(EPOCH_SIZE).context("epoch overflow")?)
+            .context("epoch height overflow")
     }
 
     /// The entry anchor of `epoch` (`sntl_epoch`).
@@ -120,12 +121,11 @@ impl ChainData<'_> {
     /// preceding epoch closes. It is distinct from an ordinary anchor in the
     /// same epoch, and anchor spans must never cross it.
     pub fn epoch_sentinel(&self, epoch: u32) -> Result<Anchor> {
-        let blocks = self.epoch_blocks(epoch)?;
-        let first = blocks
-            .iter()
-            .find(|block| block.epoch == epoch)
-            .context("missing epoch start block")?;
-        first.entry()
+        let first = match self {
+            Self::Blocks(blocks) => blocks.iter().find(|block| block.epoch == epoch).cloned(),
+            Self::Store(store) => store.block(self.epoch_start(epoch)?)?,
+        };
+        first.context("missing epoch start block")?.entry()
     }
 
     /// The stamp that created `cm`, its epoch and its preceding anchor.
@@ -151,49 +151,37 @@ impl ChainData<'_> {
         Ok(None)
     }
 
-    pub fn bucket_proof(
-        &self,
-        epoch: u32,
-        profile: QrProfile,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    /// Whether `value` is published in the synced chain.
+    pub fn published(&self, value: Tachygram) -> Result<bool> {
+        let id = hex::encode(Fp::from(value).to_bytes());
+        match self {
+            Self::Blocks(blocks) => Ok(blocks
+                .iter()
+                .flat_map(|block| &block.stamps)
+                .any(|stamp| stamp.tachygrams.contains(&id))),
+            Self::Store(store) => Ok(store.tachygram_height(&id)?.is_some()),
+        }
+    }
+
+    /// The profiles of `epoch`'s cached buckets. Unverified: check each bucket.
+    pub fn bucket_profiles(&self, epoch: u32) -> Result<Vec<QrProfile>> {
+        match self {
+            Self::Blocks(_) => Ok(Vec::new()),
+            Self::Store(store) => store.bucket_profiles(epoch),
+        }
+    }
+
+    pub fn bucket_proof(&self, epoch: u32, profile: QrProfile) -> Result<Option<Vec<u8>>> {
         match self {
             Self::Blocks(_) => Ok(None),
             Self::Store(store) => store.bucket_proof(epoch, profile),
         }
     }
 
-    pub fn epoch_node(
-        &self,
-        epoch: u32,
-        kind: u8,
-        first: u32,
-        last: u32,
-        profile: QrProfile,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        match self {
-            Self::Blocks(_) => Ok(None),
-            Self::Store(store) => store.epoch_node(epoch, kind, first, last, profile),
-        }
-    }
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "persistent cache identity and proof payload"
-    )]
-    pub fn put_epoch_node(
-        &self,
-        epoch: u32,
-        kind: u8,
-        first: u32,
-        last: u32,
-        profile: QrProfile,
-        pcd: &[u8],
-        members: &[u8],
-    ) -> Result<()> {
+    pub fn put_buckets(&self, epoch: u32, buckets: &[(QrProfile, Vec<u8>)]) -> Result<()> {
         match self {
             Self::Blocks(_) => Ok(()),
-            Self::Store(store) => {
-                store.put_epoch_node(epoch, kind, first, last, profile, pcd, members)
-            }
+            Self::Store(store) => store.put_buckets(epoch, buckets),
         }
     }
 
@@ -231,34 +219,12 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 impl Store {
     pub fn open(dir: &Path, initialize: bool) -> Result<Self> {
-        Self::open_with_mode(dir, initialize, false, true)
+        Self::open_with_mode(dir, initialize, false)
     }
     pub fn open_readonly(dir: &Path) -> Result<Self> {
-        Self::open_with_mode(dir, false, true, false)
+        Self::open_with_mode(dir, false, true)
     }
-    /// Public evidence may be populated without taking the wallet writer lock.
-    pub fn open_for_prewarm(dir: &Path) -> Result<Self> {
-        Self::open_with_mode(dir, false, true, true)
-    }
-    #[cfg(test)]
-    pub(crate) fn use_evidence_copy(&mut self, path: &Path) -> Result<()> {
-        self.evidence = Some(Connection::open(path)?);
-        self.evidence_path = Some(path.into());
-        Ok(())
-    }
-    pub fn evidence_cache(&self) -> Result<crate::evidence::Cache> {
-        crate::evidence::Cache::open(
-            self.evidence_path
-                .as_deref()
-                .context("evidence cache is read-only")?,
-        )
-    }
-    fn open_with_mode(
-        dir: &Path,
-        initialize: bool,
-        read_only: bool,
-        with_evidence: bool,
-    ) -> Result<Self> {
+    fn open_with_mode(dir: &Path, initialize: bool, read_only: bool) -> Result<Self> {
         if initialize && !dir.exists() {
             #[cfg(unix)]
             {
@@ -314,37 +280,7 @@ impl Store {
                 CREATE TABLE pending (txid TEXT PRIMARY KEY, data TEXT NOT NULL);",
             )?;
         }
-        let evidence_path = with_evidence.then(|| {
-            std::env::var_os("TACHYON_EVIDENCE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dir.join(".evidence"))
-                .join("evidence.sqlite")
-        });
-        let evidence = if let Some(path) = &evidence_path {
-            let directory = path.parent().context("invalid evidence path")?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(directory)?;
-            }
-            #[cfg(not(unix))]
-            fs::create_dir_all(&directory)?;
-            let evidence = Connection::open(path)?;
-            evidence.busy_timeout(Duration::from_secs(300))?;
-            evidence.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-            Some(evidence)
-        } else {
-            None
-        };
-        let store = Self {
-            conn,
-            evidence,
-            evidence_path,
-            invalidate_after_commit: std::cell::Cell::new(false),
-        };
+        let store = Self { conn };
         if !read_only {
             store.ensure_pending_meta()?;
         }
@@ -393,11 +329,6 @@ impl Store {
     }
     pub fn commit(&self) -> Result<()> {
         self.conn.execute_batch("COMMIT")?;
-        if self.invalidate_after_commit.replace(false) {
-            // A read-only prewarmer could have observed the old wallet history
-            // between rewind and COMMIT. Fence that interval's builders too.
-            self.evidence_cache()?.invalidate()?;
-        }
         Ok(())
     }
     pub fn set_config(&self, config: &Config) -> Result<()> {
@@ -414,29 +345,6 @@ impl Store {
         let config: Config = serde_json::from_str(&json)?;
         ensure!(config.version == 1, "unsupported wallet database version");
         Ok(config)
-    }
-    pub fn check_evidence_identity(&self, config: &Config) -> Result<()> {
-        if self.evidence.is_none() {
-            return Ok(());
-        }
-        let conn = self.evidence_conn();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO metadata VALUES('network_id', ?)",
-            [&config.network_id],
-        )?;
-        let cached: String = conn.query_row(
-            "SELECT value FROM metadata WHERE key='network_id'",
-            [],
-            |row| row.get(0),
-        )?;
-        ensure!(
-            cached == config.network_id,
-            "shared evidence belongs to a different network; use a fresh evidence directory"
-        );
-        Ok(())
     }
     pub fn network_identity_valid(&self, config: &Config) -> Result<bool> {
         self.ensure_indexes()?;
@@ -618,116 +526,47 @@ impl Store {
                 epoch INTEGER NOT NULL, depth INTEGER NOT NULL, bits INTEGER NOT NULL,
                 pcd BLOB NOT NULL, members BLOB NOT NULL,
                 PRIMARY KEY(epoch, depth, bits));
-             CREATE TABLE IF NOT EXISTS epoch_nodes (
-                epoch INTEGER NOT NULL, kind INTEGER NOT NULL,
-                first INTEGER NOT NULL, last INTEGER NOT NULL,
-                depth INTEGER NOT NULL, bits INTEGER NOT NULL,
-                pcd BLOB NOT NULL, members BLOB NOT NULL,
-                PRIMARY KEY(epoch, kind, first, last, depth, bits));
              CREATE TABLE IF NOT EXISTS spendable_proofs (
                 note_id TEXT PRIMARY KEY, pcd BLOB NOT NULL);",
         )?;
         Ok(())
     }
-    fn evidence_conn(&self) -> &Connection {
-        self.evidence.as_ref().unwrap_or(&self.conn)
+    pub fn bucket_profiles(&self, epoch: u32) -> Result<Vec<QrProfile>> {
+        self.ensure_proof_tables()?;
+        self.conn
+            .prepare("SELECT depth, bits FROM epoch_proofs WHERE epoch=?")?
+            .query_map([epoch], |row| {
+                Ok(QrProfile {
+                    depth: row.get(0)?,
+                    bits: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
     }
-    fn ensure_evidence_tables(&self) -> Result<()> {
-        let conn = self.evidence_conn();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS epoch_proofs (
-                epoch INTEGER NOT NULL, depth INTEGER NOT NULL, bits INTEGER NOT NULL,
-                pcd BLOB NOT NULL, members BLOB NOT NULL,
-                PRIMARY KEY(epoch, depth, bits));
-             CREATE TABLE IF NOT EXISTS epoch_nodes (
-                epoch INTEGER NOT NULL, kind INTEGER NOT NULL,
-                first INTEGER NOT NULL, last INTEGER NOT NULL,
-                depth INTEGER NOT NULL, bits INTEGER NOT NULL,
-                pcd BLOB NOT NULL, members BLOB NOT NULL,
-                PRIMARY KEY(epoch, kind, first, last, depth, bits));",
-        )?;
-        Ok(())
+    pub fn bucket_proof(&self, epoch: u32, profile: QrProfile) -> Result<Option<Vec<u8>>> {
+        self.ensure_proof_tables()?;
+        self.conn
+            .query_row(
+                "SELECT pcd FROM epoch_proofs WHERE epoch=? AND depth=? AND bits=?",
+                params![epoch, profile.depth, profile.bits],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
-    fn clear_shared_epoch_proofs(&self) -> Result<()> {
-        self.invalidate_after_commit.set(true);
-        self.evidence_cache()?.invalidate()?;
-        self.ensure_evidence_tables()?;
-        let conn = self.evidence_conn();
-        conn.execute("DELETE FROM epoch_proofs", [])?;
-        conn.execute("DELETE FROM epoch_nodes", [])?;
-        Ok(())
-    }
-    pub fn bucket_proof(
-        &self,
-        epoch: u32,
-        profile: QrProfile,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        self.ensure_evidence_tables()?;
-        let sql = "SELECT pcd,members FROM epoch_proofs WHERE epoch=? AND depth=? AND bits=?";
-        let values = params![epoch, profile.depth, profile.bits];
-        let read = |conn: &Connection| {
-            conn.query_row(sql, values, |row| Ok((row.get(0)?, row.get(1)?)))
-                .optional()
-        };
-        let value = read(self.evidence_conn())?;
-        if value.is_some() || !self.table_exists("epoch_proofs")? {
-            return Ok(value);
+    /// Replaces every cached bucket of `epoch`.
+    pub fn put_buckets(&self, epoch: u32, buckets: &[(QrProfile, Vec<u8>)]) -> Result<()> {
+        self.ensure_proof_tables()?;
+        self.conn
+            .execute("DELETE FROM epoch_proofs WHERE epoch=?", [epoch])?;
+        for (profile, pcd) in buckets {
+            // `members` is legacy: a row is trusted by its header and proof alone.
+            self.conn.execute(
+                "INSERT INTO epoch_proofs VALUES(?, ?, ?, ?, x'')",
+                params![epoch, profile.depth, profile.bits, pcd],
+            )?;
         }
-        // Older standalone wallets stored public evidence inside the wallet.
-        // Read it in place; promotion still requires full proof validation.
-        Ok(read(&self.conn)?)
-    }
-    pub fn epoch_node(
-        &self,
-        epoch: u32,
-        kind: u8,
-        first: u32,
-        last: u32,
-        profile: QrProfile,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        self.ensure_evidence_tables()?;
-        let sql = "SELECT pcd,members FROM epoch_nodes WHERE epoch=? AND kind=? AND first=? AND last=? AND depth=? AND bits=?";
-        let values = params![epoch, kind, first, last, profile.depth, profile.bits];
-        let read = |conn: &Connection| {
-            conn.query_row(sql, values, |row| Ok((row.get(0)?, row.get(1)?)))
-                .optional()
-        };
-        let value = read(self.evidence_conn())?;
-        if value.is_some() || !self.table_exists("epoch_nodes")? {
-            return Ok(value);
-        }
-        Ok(read(&self.conn)?)
-    }
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "persistent cache identity and proof payload"
-    )]
-    pub fn put_epoch_node(
-        &self,
-        epoch: u32,
-        kind: u8,
-        first: u32,
-        last: u32,
-        profile: QrProfile,
-        pcd: &[u8],
-        members: &[u8],
-    ) -> Result<()> {
-        self.ensure_evidence_tables()?;
-        self.evidence_conn().execute(
-            "INSERT INTO epoch_nodes VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(epoch, kind, first, last, depth, bits)
-             DO UPDATE SET pcd=excluded.pcd, members=excluded.members",
-            params![
-                epoch,
-                kind,
-                first,
-                last,
-                profile.depth,
-                profile.bits,
-                pcd,
-                members
-            ],
-        )?;
         Ok(())
     }
     pub fn spendable_proof(&self, note_id: &str) -> Result<Option<Vec<u8>>> {
@@ -757,16 +596,12 @@ impl Store {
             self.conn.execute("DELETE FROM tachygrams", [])?;
             self.conn.execute("DELETE FROM block_transactions", [])?;
         }
-        if self.table_exists("epoch_proofs")? {
-            self.conn.execute("DELETE FROM epoch_proofs", [])?;
-            self.conn.execute("DELETE FROM epoch_nodes", [])?;
-            self.conn.execute("DELETE FROM spendable_proofs", [])?;
-        }
+        self.conn.execute("DELETE FROM epoch_proofs", [])?;
+        self.conn.execute("DELETE FROM spendable_proofs", [])?;
         if self.table_exists("note_nullifiers")? {
             self.conn
                 .execute("UPDATE note_nullifiers SET spent_height=NULL", [])?;
         }
-        self.clear_shared_epoch_proofs()?;
         self.clear_funding_snapshot()
     }
     pub fn notes(&self) -> Result<Vec<Receipt>> {
@@ -1067,14 +902,9 @@ impl Store {
     }
     fn rewind_proofs(&self, _height: u32) -> Result<()> {
         self.ensure_proof_tables()?;
-        // Reorgs are rare; discard composed evidence rather than risk reusing
-        // a bucket or lineage derived from a removed epoch transition.
-        if self.table_exists("epoch_proofs")? {
-            self.conn.execute("DELETE FROM epoch_proofs", [])?;
-            self.conn.execute("DELETE FROM epoch_nodes", [])?;
-            self.conn.execute("DELETE FROM spendable_proofs", [])?;
-        }
-        self.clear_shared_epoch_proofs()?;
+        // Reorgs are rare; discard lineages rather than risk reusing one from a
+        // removed transition. Cached buckets are checked against the chain on load.
+        self.conn.execute("DELETE FROM spendable_proofs", [])?;
         Ok(())
     }
     pub fn put_note(&self, receipt: &Receipt) -> Result<()> {

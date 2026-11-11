@@ -66,19 +66,9 @@ Replace `PAYMENT_TXID` with the ID returned by `send`. Share `payment.json` priv
 
 Exports include the transaction ID, plus its block height and hash when known to the wallet. Add `--legacy` for older receivers that reject location metadata.
 
-## Shared epoch evidence
+## Closed epochs
 
-After syncing the first block of a new epoch, finalize the closed epochs before sending:
-
-```sh
-export TACHYON_EVIDENCE_DIR=/path/to/shared/evidence
-./target/release/zcash-devtool tachyon --wallet-dir ~/tachyon-personal sync --max-blocks 10000
-./target/release/zcash-devtool tachyon --wallet-dir ~/tachyon-personal prewarm-epochs
-```
-
-`prewarm-epochs` reads wallet history without locking the wallet for writes. It enumerates every capacity-bounded QR profile, including empty buckets. Concurrent processes share renewable 30-second leases; crashed owners can be replaced after expiration. Proofs are verified against the chain on every load. Network, dependency revisions, schema, members and boundary anchors isolate cached evidence; reorgs fence active builders. Existing intake caches are retained. Without the environment variable, evidence lives in the wallet's `.evidence` directory.
-
-The workload sidecar runs this automatically and continues mining while it runs. `evidence-generation` reports the shared cache's reorg generation without constructing proofs. Neither command sends transactions or mines blocks.
+The first payment that needs a closed epoch proves that epoch's QR buckets and caches all of them in the wallet database. A cached bucket is reused only if it verifies and matches the synced chain's epoch entry anchors; otherwise it is rebuilt.
 
 ## License
 

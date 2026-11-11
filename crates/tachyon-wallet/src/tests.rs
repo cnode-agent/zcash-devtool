@@ -16,6 +16,7 @@ use crate::{
     chain::{self, Block},
     control::Control,
     note::{self, Receipt},
+    proofs::Prover,
     transaction::{self, FEE, Funding, Payment},
 };
 
@@ -511,26 +512,6 @@ fn store_indexes_new_blocks_and_rewinds_without_rescanning() -> Result<()> {
 }
 
 #[test]
-fn epoch_node_cache_roundtrip_and_reorg_invalidation() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        directory.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )?;
-    let store = crate::store::Store::open(directory.path(), true)?;
-    let profile = zcash_tachyon::QrProfile::ROOT;
-    store.put_epoch_node(0, 0, 0, 0, profile, b"proof", b"members")?;
-    assert_eq!(
-        store.epoch_node(0, 0, 0, 0, profile)?,
-        Some((b"proof".to_vec(), b"members".to_vec()))
-    );
-    store.rewind(0)?;
-    assert_eq!(store.epoch_node(0, 0, 0, 0, profile)?, None);
-    Ok(())
-}
-
-#[test]
 fn note_spend_tracking_updates_from_new_blocks_and_rewinds() -> Result<()> {
     let directory = tempfile::tempdir()?;
     #[cfg(unix)]
@@ -623,18 +604,23 @@ fn cached_spendability_advances_only_across_new_epochs() -> Result<()> {
         store.put_block(block)?;
     }
     let chain = crate::store::ChainData::Store(&store);
+    let prover = Prover::Local(&chain);
     let control = Control::new(true);
     let key = SpendingKey::from(SEED);
-    let first = crate::proofs::spendable(&chain, &key, receipt.note()?, &control)?;
+    let first = crate::proofs::spendable(&chain, &prover, &key, receipt.note()?, &control)?;
     let cached = store
         .spendable_proof(&receipt.id()?)?
         .expect("spendability proof is cached");
     assert!(!cached.is_empty());
-    let second = crate::proofs::spendable(&chain, &key, receipt.note()?, &control)?;
+    let second = crate::proofs::spendable(&chain, &prover, &key, receipt.note()?, &control)?;
     assert_eq!(second.data(), first.data());
-    assert_eq!(crate::proofs::prewarm(&store, &control)?["profiles"], 2);
+    // The payment cached every bucket of both closed epochs.
+    assert_eq!(
+        store.bucket_profiles(0)?.len() + store.bucket_profiles(1)?.len(),
+        2
+    );
     store.put_spendable_proof(&receipt.id()?, &[0u8; 32])?;
-    let recovered = crate::proofs::spendable(&chain, &key, receipt.note()?, &control)?;
+    let recovered = crate::proofs::spendable(&chain, &prover, &key, receipt.note()?, &control)?;
     assert_eq!(recovered.data(), first.data());
     assert_ne!(store.spendable_proof(&receipt.id()?)?, Some(vec![0u8; 32]));
     while blocks.last().unwrap().epoch < 3 {
@@ -645,7 +631,7 @@ fn cached_spendability_advances_only_across_new_epochs() -> Result<()> {
             store.put_block(block)?;
         }
     }
-    let third = crate::proofs::spendable(&chain, &key, receipt.note()?, &control)?;
+    let third = crate::proofs::spendable(&chain, &prover, &key, receipt.note()?, &control)?;
     assert!(third.data().1 > second.data().1);
     assert_eq!(
         third.data().2,
@@ -674,9 +660,11 @@ fn spent_note_cannot_produce_closed_epoch_absence_evidence() -> Result<()> {
     while blocks.last().unwrap().epoch < 1 {
         mine(&mut blocks, None)?;
     }
+    let chain = crate::store::ChainData::Blocks(&blocks);
     assert!(
         crate::proofs::spendable(
-            &crate::store::ChainData::Blocks(&blocks),
+            &chain,
+            &Prover::Local(&chain),
             &SpendingKey::from(SEED),
             receipt.note()?,
             &Control::new(true)
@@ -706,12 +694,22 @@ fn spent_note_cannot_hide_in_another_routed_bucket() -> Result<()> {
     while blocks.last().unwrap().epoch < 1 {
         mine(&mut blocks, None)?;
     }
-    let error = crate::proofs::spendable(
-        &crate::store::ChainData::Blocks(&blocks),
-        &SpendingKey::from(SEED),
-        receipt.note()?,
-        &Control::new(true),
-    )
+    let chain = crate::store::ChainData::Blocks(&blocks);
+    let prover = Prover::Local(&chain);
+    let (key, note, control) = (SpendingKey::from(SEED), receipt.note()?, Control::new(true));
+    let error = crate::proofs::spendable(&chain, &prover, &key, note, &control)
+        .err()
+        .expect("the local tachygram index marks the note spent");
+    assert!(error.to_string().contains("note is spent"), "{error}");
+    // Below that index check, the proof still refuses: the nullifier is tested
+    // against its own routed bucket, which holds it.
+    let nf = key
+        .derive_nullifier_private()
+        .derive_note_private(note.psi)
+        .derive_nullifier(EpochIndex::new(0));
+    let error = oss_core::prove_unspent(0, &[nf], |epoch, value| {
+        prover.bucket_for(epoch, value, &control)
+    })
     .err()
     .expect("a spent note must fail absence verification");
     assert!(
@@ -722,7 +720,7 @@ fn spent_note_cannot_hide_in_another_routed_bucket() -> Result<()> {
 }
 
 #[test]
-fn prewarm_makes_first_payment_a_hit_and_corrupt_evidence_is_rebuilt() -> Result<()> {
+fn cached_local_bucket_is_rebuilt_after_its_closing_block_reorgs() -> Result<()> {
     let directory = tempfile::tempdir()?;
     #[cfg(unix)]
     std::fs::set_permissions(
@@ -734,149 +732,37 @@ fn prewarm_makes_first_payment_a_hit_and_corrupt_evidence_is_rebuilt() -> Result
     let receipt = own(1_000_000);
     let funded = shield(&blocks, &receipt)?;
     mine(&mut blocks, Some(&funded))?;
-    while blocks.last().unwrap().epoch < 2 {
+    while blocks.last().unwrap().epoch < 1 {
         mine(&mut blocks, None)?;
     }
-    store.set_config(&crate::store::Config {
-        version: 1,
-        rpc_url: String::new(),
-        cookie_file: None,
-        activation: 8,
-        activation_hash: genesis().hash,
-        genesis: String::new(),
-        network_id: NETWORK.into(),
-        seed: SEED,
-        birthday_height: Some(8),
-    })?;
     for block in &blocks {
         store.put_block(block)?;
     }
-    store.commit()?;
-    drop(store);
-    let readonly = crate::store::Store::open_for_prewarm(directory.path())?;
-    let cold = Control::with_timing(true, true);
-    assert_eq!(crate::proofs::prewarm(&readonly, &cold)?["profiles"], 2);
-    assert_eq!(cold.cache_counts("bucket"), (0, 2));
-    let repeated = Control::with_timing(true, true);
-    assert_eq!(crate::proofs::prewarm(&readonly, &repeated)?["profiles"], 2);
-    assert_eq!(
-        repeated.cache_counts("bucket"),
-        (0, 0),
-        "completed epochs should not be reloaded at every boundary"
-    );
-    // Prewarm does not acquire the wallet writer lock.
-    let store = crate::store::Store::open(directory.path(), false)?;
-    let payment = Control::with_timing(true, true);
-    let proof = crate::proofs::spendable(
-        &crate::store::ChainData::Store(&store),
-        &SpendingKey::from(SEED),
-        receipt.note()?,
-        &payment,
-    )?;
-    assert_eq!(payment.cache_counts("bucket"), (2, 0));
-    let db = rusqlite::Connection::open(directory.path().join(".evidence/evidence.sqlite"))?;
-    db.execute("UPDATE bucket_jobs SET members=x'00' WHERE epoch=0", [])?;
-    store.put_spendable_proof(&receipt.id()?, b"corrupt")?;
-    let recovery = Control::with_timing(true, true);
-    let rebuilt = crate::proofs::spendable(
-        &crate::store::ChainData::Store(&store),
-        &SpendingKey::from(SEED),
-        receipt.note()?,
-        &recovery,
-    )?;
-    assert_eq!(rebuilt.data(), proof.data());
-    assert_eq!(recovery.cache_counts("bucket"), (1, 1));
-    // A well-formed, verified proof for a different epoch/anchor is also a
-    // cache miss; wire validity alone never establishes chain membership.
-    db.execute(
-        "UPDATE bucket_jobs SET pcd=(SELECT pcd FROM bucket_jobs WHERE epoch=1) WHERE epoch=0",
-        [],
-    )?;
-    store.put_spendable_proof(&receipt.id()?, b"corrupt")?;
-    let wrong_epoch = Control::with_timing(true, true);
-    let repaired = crate::proofs::spendable(
-        &crate::store::ChainData::Store(&store),
-        &SpendingKey::from(SEED),
-        receipt.note()?,
-        &wrong_epoch,
-    )?;
-    assert_eq!(repaired.data(), proof.data());
-    assert_eq!(wrong_epoch.cache_counts("bucket"), (1, 1));
-    store.rewind(8)?;
-    assert_eq!(
-        db.query_row("SELECT count(*) FROM bucket_jobs", [], |r| r
-            .get::<_, u32>(0))?,
-        0
-    );
-    Ok(())
-}
+    let chain = crate::store::ChainData::Store(&store);
+    let prover = Prover::Local(&chain);
+    let cm = Fp::from(Tachygram::from(receipt.note()?.commitment()));
+    let control = Control::with_timing(true, true);
+    let built = prover.bucket_for(0, cm, &control)?;
+    assert_eq!(prover.bucket_for(0, cm, &control)?.data(), built.data());
+    assert_eq!(control.cache_counts("bucket"), (1, 1));
 
-#[test]
-#[ignore = "subprocess entry point for real proof single-flight test"]
-fn prewarm_process() -> Result<()> {
-    let path = std::path::PathBuf::from(std::env::var_os("PREWARM_TEST_WALLET").unwrap());
-    let store = crate::store::Store::open_for_prewarm(&path)?;
-    crate::proofs::prewarm(&store, &Control::new(true))?;
-    Ok(())
-}
-
-#[test]
-fn seventeen_wallet_processes_share_verified_epoch_proofs() -> Result<()> {
-    use std::process::{Command, Stdio};
-    let dir = tempfile::tempdir()?;
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        dir.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )?;
-    let store = crate::store::Store::open(dir.path(), true)?;
-    let mut blocks = vec![genesis()];
-    let receipt = own(1_000_000);
-    let funded = shield(&blocks, &receipt)?;
-    mine(&mut blocks, Some(&funded))?;
-    while blocks.last().unwrap().epoch < 2 {
-        mine(&mut blocks, None)?;
-    }
-    store.set_config(&crate::store::Config {
-        version: 1,
-        rpc_url: String::new(),
-        cookie_file: None,
-        activation: 8,
-        activation_hash: genesis().hash,
-        genesis: String::new(),
-        network_id: NETWORK.into(),
-        seed: SEED,
-        birthday_height: Some(8),
-    })?;
-    for block in &blocks {
+    // Replace epoch 0's closing block with one that carries a stamp, which
+    // moves epoch 1's entry anchor. The verified cached row no longer matches.
+    let closing = blocks.len() - 2;
+    blocks.truncate(closing);
+    store.rewind(blocks.last().unwrap().height)?;
+    let other = shield(&blocks, &own(2_000_000))?;
+    mine(&mut blocks, Some(&other))?;
+    mine(&mut blocks, None)?;
+    for block in &blocks[closing..] {
         store.put_block(block)?;
     }
-    store.evidence_cache()?;
-    store.commit()?;
-    drop(store);
-    let db = rusqlite::Connection::open(dir.path().join(".evidence/evidence.sqlite"))?;
-    db.execute_batch("CREATE TABLE completed(epoch INTEGER,depth INTEGER,bits INTEGER);
-        CREATE TRIGGER record_completion AFTER UPDATE OF pcd ON bucket_jobs WHEN OLD.pcd IS NULL AND NEW.pcd IS NOT NULL
-        BEGIN INSERT INTO completed VALUES(NEW.epoch,NEW.depth,NEW.bits); END;")?;
-    for batch in (0..17).step_by(4) {
-        let mut children = Vec::new();
-        for _ in batch..(batch + 4).min(17) {
-            children.push(
-                Command::new(std::env::current_exe()?)
-                    .args(["--exact", "tests::prewarm_process", "--ignored"])
-                    .env("PREWARM_TEST_WALLET", dir.path())
-                    .stdout(Stdio::null())
-                    .spawn()?,
-            );
-        }
-        for mut child in children {
-            anyhow::ensure!(child.wait()?.success(), "prewarm child failed");
-        }
-    }
-    let completions: Vec<(u32, u32)> = db
-        .prepare("SELECT epoch,count(*) FROM completed GROUP BY epoch ORDER BY epoch")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    assert_eq!(completions, vec![(0, 1), (1, 1)]);
+    let rebuilt = prover.bucket_for(0, cm, &control)?;
+    assert_eq!(control.cache_counts("bucket"), (1, 2));
+    assert_ne!(rebuilt.data().2, built.data().2);
+    assert_eq!(rebuilt.data().2, chain.epoch_sentinel(1)?);
+    // The rebuilt row replaced the stale one.
+    assert_eq!(prover.bucket_for(0, cm, &control)?.data(), rebuilt.data());
+    assert_eq!(control.cache_counts("bucket"), (2, 2));
     Ok(())
 }
