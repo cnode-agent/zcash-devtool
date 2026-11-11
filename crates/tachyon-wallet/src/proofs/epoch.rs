@@ -212,6 +212,57 @@ fn merge_cached(
     Ok(merged)
 }
 
+/// Adjacent intakes being merged pairwise, in anchor order.
+///
+/// Works like a binary counter: two neighbours covering the same number of
+/// stamps merge at once, so each member is handled once per level and only a
+/// logarithmic number of intakes is held at a time.
+#[derive(Default)]
+struct Pending(Vec<(usize, u32, u32, Intake)>);
+impl Pending {
+    fn members(&self) -> usize {
+        self.0.iter().map(|(_, _, _, i)| i.members.len()).sum()
+    }
+    fn merge_top(&mut self, chain: &ChainData<'_>, epoch: u32, control: &Control) -> Result<()> {
+        let (right_stamps, _, last, right) = self.0.pop().context("missing right intake")?;
+        let (left_stamps, first, _, left) = self.0.pop().context("missing left intake")?;
+        let merged = merge_cached(chain, epoch, first, left, last, right, control)?;
+        self.0
+            .push((left_stamps + right_stamps, first, last, merged));
+        Ok(())
+    }
+    fn push(
+        &mut self,
+        chain: &ChainData<'_>,
+        epoch: u32,
+        index: u32,
+        intake: Intake,
+        control: &Control,
+    ) -> Result<()> {
+        self.0.push((1, index, index, intake));
+        while let [.., (left, ..), (right, ..)] = self.0.as_slice()
+            && left == right
+        {
+            self.merge_top(chain, epoch, control)?;
+        }
+        Ok(())
+    }
+    fn finish(
+        &mut self,
+        chain: &ChainData<'_>,
+        epoch: u32,
+        control: &Control,
+    ) -> Result<Option<(u32, u32, Intake)>> {
+        while self.0.len() > 1 {
+            self.merge_top(chain, epoch, control)?;
+        }
+        Ok(self
+            .0
+            .pop()
+            .map(|(_, first, last, intake)| (first, last, intake)))
+    }
+}
+
 impl Intake {
     #[expect(
         clippy::too_many_arguments,
@@ -422,7 +473,7 @@ impl Epoch {
         let epoch_index = EpochIndex::new(epoch);
         let discriminant = QrDiscriminant(Fp::ONE);
         let mut chunks = Vec::new();
-        let mut current: Option<(u32, u32, Intake)> = None;
+        let mut pending = Pending::default();
         let total = self.stamps.len();
         for (index, (before, members)) in self.stamps.iter().cloned().enumerate() {
             let index = u32::try_from(index)?;
@@ -471,26 +522,12 @@ impl Epoch {
                 put_intake(chain, epoch, 0, index, index, &intake)?;
                 intake
             };
-            current = match current.take() {
-                Some((first, _, left))
-                    if left.members.len() + intake.members.len() <= max_polynomial_members() =>
-                {
-                    Some((
-                        first,
-                        index,
-                        merge_cached(chain, epoch, first, left, index, intake, control)?,
-                    ))
-                }
-                Some(chunk) => {
-                    chunks.push(chunk);
-                    Some((index, index, intake))
-                }
-                None => Some((index, index, intake)),
-            };
+            if pending.members() + intake.members.len() > max_polynomial_members() {
+                chunks.extend(pending.finish(chain, epoch, control)?);
+            }
+            pending.push(chain, epoch, index, intake, control)?;
         }
-        if let Some(chunk) = current {
-            chunks.push(chunk);
-        }
+        chunks.extend(pending.finish(chain, epoch, control)?);
         if chunks.is_empty() {
             control.stage(format!("Proving empty epoch {epoch}…"))?;
             let (proof, ()) = PROOF_SYSTEM.seed(
@@ -1056,6 +1093,49 @@ mod tests {
         )?;
         store.put_epoch_node(0, 0, 0, 0, QrProfile::ROOT, b"corrupt", b"members")?;
         assert!(load_intake(&chain, 0, 0, 0, 0, QrProfile::ROOT, &Control::new(true))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_merges_keep_anchor_order_for_an_odd_group() -> Result<()> {
+        let epoch = EpochIndex::new(0);
+        let discriminant = QrDiscriminant(Fp::from(1));
+        let blocks = Vec::new();
+        let chain = ChainData::from(&blocks);
+        let control = Control::new(true);
+        let mut anchor = Anchor::default();
+        let mut pending = Pending::default();
+        for index in 0..5u32 {
+            let members = vec![Tachygram::from(Fp::from(u64::from(index) + 1))];
+            let (proof, ()) = PROOF_SYSTEM.seed(
+                &mut rand::rng(),
+                qr::QrStampIntakeSeed,
+                witness::qr_stamp_intake_seed(((), ()), anchor, epoch, discriminant, &members),
+            )?;
+            anchor = anchor.next_stamp(
+                epoch,
+                &members
+                    .iter()
+                    .copied()
+                    .collect::<TachygramSetPoly>()
+                    .commit(),
+            )?;
+            pending.push(&chain, 0, index, Intake { proof, members }, &control)?;
+        }
+        // Five stamps leave a merged run of four and a single.
+        assert_eq!(pending.0.len(), 2);
+        assert_eq!(pending.members(), 5);
+        let (first, last, merged) = pending.finish(&chain, 0, &control)?.unwrap();
+        assert_eq!((first, last), (0, 4));
+        assert_eq!(merged.proof.data().1, Anchor::default());
+        assert_eq!(merged.proof.data().2, anchor);
+        assert_eq!(
+            merged.members,
+            (1..=5)
+                .map(|i| Tachygram::from(Fp::from(i)))
+                .collect::<Vec<_>>()
+        );
+        assert!(pending.finish(&chain, 0, &control)?.is_none());
         Ok(())
     }
 
