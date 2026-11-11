@@ -111,9 +111,18 @@ impl Prover<'_> {
         nfs: &[Nullifier],
         control: &Control,
     ) -> Result<Pcd<pool::ArbitraryUnspent>> {
-        let chain = match self {
-            Self::Local(chain) => chain,
-            Self::Remote(oss, chain) => {
+        let (Self::Local(chain) | Self::Remote(_, chain)) = self;
+        // Checked first in both modes: an OSS asked about a published value
+        // could link the request to the spending transaction (design §4.4).
+        for (epoch, nf) in (epoch_start..).zip(nfs) {
+            ensure!(
+                !chain.published(Tachygram::from(*nf))?,
+                "note is spent: its epoch {epoch} nullifier is published"
+            );
+        }
+        match self {
+            Self::Local(_) => {}
+            Self::Remote(oss, _) => {
                 control.stage(format!(
                     "Requesting unspent evidence for {} epochs from {epoch_start}…",
                     nfs.len()
@@ -142,12 +151,6 @@ impl Prover<'_> {
                 );
                 return Ok(segment);
             }
-        };
-        for (epoch, nf) in (epoch_start..).zip(nfs) {
-            ensure!(
-                !chain.published(Tachygram::from(*nf))?,
-                "note is spent: its epoch {epoch} nullifier is published"
-            );
         }
         control.stage(format!(
             "Proving unspent evidence for {} epochs from {epoch_start}…",

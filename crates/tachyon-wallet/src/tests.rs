@@ -818,17 +818,40 @@ fn spent_note_cannot_hide(remote: bool) -> Result<()> {
     let chain = ChainData::Blocks(&blocks);
     let prover = prover_for(&chain, oss.as_ref(), &blocks)?;
     let (key, note, control) = (SpendingKey::from(SEED), receipt.note()?, Control::new(true));
-    // The wallet's own tachygram index, or the OSS's, marks the note spent.
+    // The wallet's own tachygram index marks the note spent, in remote mode
+    // too, before any OSS request (that text is not the OSS's `Spent`).
     let error = crate::proofs::spendable(&chain, &prover, &key, note, &control)
         .err()
         .expect("a spent note is not spendable");
-    assert!(error.to_string().contains("note is spent"), "{error}");
-    // Below that index check, the proof still refuses: the nullifier is tested
-    // against its own routed bucket, which holds it.
+    assert!(
+        error
+            .to_string()
+            .contains("note is spent: its epoch 0 nullifier is published"),
+        "{error}"
+    );
     let nf = key
         .derive_nullifier_private()
         .derive_note_private(note.psi)
         .derive_nullifier(EpochIndex::new(0));
+    // Asked directly, the OSS's own index answers `Spent`.
+    if let Some(oss) = &oss {
+        let error = oss
+            .client
+            .call::<oss_core::UnspentResult>(
+                "oss_unspent",
+                oss_core::UnspentParams {
+                    epoch_start: 0,
+                    nullifiers: vec![hex::encode(Fp::from(nf).to_bytes())],
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("note is spent: the OSS has"),
+            "{error}"
+        );
+    }
+    // Below both index checks, the proof still refuses: the nullifier is
+    // tested against its own routed bucket, which holds it.
     let error = oss_core::prove_unspent(0, &[nf], |epoch, value| {
         prover.bucket_for(epoch, value, &control)
     })
