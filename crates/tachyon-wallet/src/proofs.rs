@@ -13,7 +13,7 @@ use zcash_tachyon::{
     witness,
 };
 
-use crate::{chain::anchor, control::Control, store::ChainData};
+use crate::{chain::{anchor, anchor_hex}, control::Control, store::ChainData};
 use udon::field::Field;
 use zcash_tachyon::pasta::Fp;
 
@@ -354,7 +354,10 @@ pub fn anchor_spans(
     }
     ensure!(
         cursor == target,
-        "cannot reach the requested anchor: start {start:?}, target {target:?}, current sentinel {sentinel:?}; the spendability proof is not in the active epoch"
+        "cannot reach the requested anchor: start {}, target {}, current sentinel {}; the spendability proof is not in the active epoch",
+        anchor_hex(start),
+        anchor_hex(target),
+        anchor_hex(sentinel)
     );
     let span = span.context("no anchor span reaches the requested anchor")?;
     control.check()?;
