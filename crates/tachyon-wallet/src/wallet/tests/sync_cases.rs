@@ -124,7 +124,7 @@ fn sync_many_shares_block_fetch_and_validation() -> Result<()> {
     for dir in [&alice, &bob] {
         let store = Store::open(dir, false)?;
         let config = store.config()?;
-        crate::wallet::sync::sync_with_cache(&store, &config, 1000, None, &control, &cache)?;
+        crate::wallet::sync::sync_with_cache(&store, &config, 1000, None, &control, &cache, None)?;
         store.commit()?;
     }
     assert_eq!(cache.lock().unwrap().stats(), (1, 1));

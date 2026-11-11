@@ -33,6 +33,9 @@ struct NodeData {
     cancel_request: Option<(String, Option<Value>, Control)>,
     requests: Vec<(String, Value)>,
     pruned_heights: BTreeSet<u32>,
+    /// `getblock` and `getrawtransaction` also fail at pruned heights, as
+    /// Zakura's do once the raw transactions are gone.
+    zakura_pruning: bool,
 }
 struct Node {
     url: String,
@@ -66,6 +69,7 @@ impl Node {
             cancel_request: None,
             requests: vec![],
             pruned_heights: BTreeSet::new(),
+            zakura_pruning: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_data = data.clone();
@@ -88,8 +92,7 @@ impl Node {
                 let mut length = 0;
                 loop {
                     let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
                     if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
@@ -98,8 +101,13 @@ impl Node {
                 }
                 assert!(length < 16 * 1024 * 1024);
                 let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
-                let request: Value = serde_json::from_slice(&body).unwrap();
+                // An OSS shutting down can hang up mid-request.
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
                 let mut data = thread_data.lock().unwrap();
                 let params = &request["params"];
                 data.requests
@@ -108,6 +116,7 @@ impl Node {
                 let result = match request["method"].as_str().unwrap() {
                     "getblockchaininfo" => json!({"chain":"test"}),
                     "getblockcount" => json!(data.blocks.last().unwrap().height),
+                    "getbestblockhash" => json!(data.blocks.last().unwrap().hash),
                     "getaddressutxos" => {
                         assert_eq!(params[0]["chainInfo"], true);
                         if data.fail_funding_sync {
@@ -137,10 +146,9 @@ impl Node {
                             error = json!({"code":-1,"message":"tachygram payload pruned"});
                             Value::Null
                         } else {
-                            serde_json::to_value(
+                            oss::testing::served(
                                 data.blocks.iter().find(|b| b.height == h).unwrap(),
                             )
-                            .unwrap()
                         }
                     }
                     "getblock" => {
@@ -157,6 +165,9 @@ impl Node {
                                 .iter()
                                 .find(|b| b.hash == id || Some(b.height) == id.parse::<u32>().ok())
                                 .unwrap();
+                            if data.zakura_pruning && data.pruned_heights.contains(&block.height) {
+                                error = json!({"code":-1,"message":"block not found"});
+                            }
                             json!({"hash":block.hash,"height":block.height,"tx":block.transactions})
                         }
                     }
@@ -177,6 +188,10 @@ impl Node {
                             .blocks
                             .iter()
                             .find(|block| block.transactions.iter().any(|id| id == txid))
+                            .filter(|block| {
+                                !(data.zakura_pruning
+                                    && data.pruned_heights.contains(&block.height))
+                            })
                         {
                             json!({"txid":txid,"blockhash":block.hash})
                         } else if data.mempool.iter().any(|raw| {
@@ -303,6 +318,19 @@ fn command_with_id(dir: &std::path::Path, command: Operation, id: Option<&str>) 
         expected_tip: None,
         quiet: true,
         oss_url: None,
+        oss_cookie_file: None,
+        command,
+    }
+    .execute()
+}
+/// Runs `command` in remote mode, against the OSS at `url`.
+fn remote(dir: &std::path::Path, url: &str, command: Operation) -> Result<Value> {
+    Command {
+        wallet_dir: dir.into(),
+        operation_id: None,
+        expected_tip: None,
+        quiet: true,
+        oss_url: Some(url.into()),
         oss_cookie_file: None,
         command,
     }
@@ -1920,5 +1948,124 @@ fn reservations_survive_restarts_and_expire_only_after_expiry_height() -> Result
         note_states(&store, &config, &Control::new(true), true)?[0].1,
         "available"
     );
+    Ok(())
+}
+
+/// Shields 100_000 from each funding amount, one mined block per note.
+fn shield_each(node: &Node, dir: &std::path::Path, amounts: &[u64]) -> Result<()> {
+    let address = init_wallet(node, dir)?;
+    install_funding(node, &address, amounts)?;
+    for _ in amounts {
+        command(
+            dir,
+            Operation::Shield {
+                amount_zat: Some(100_000),
+                txid: None,
+                index: None,
+            },
+        )?;
+        node.mine()?;
+    }
+    Ok(())
+}
+
+const SYNC: Operation = Operation::Sync {
+    max_blocks: 1000,
+    from_height: None,
+};
+
+#[test]
+fn remote_wallet_syncs_and_spends_a_note_whose_block_the_node_pruned() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    shield_each(&node, &dir, &[150_000])?; // The note is mined at height 9.
+    {
+        let mut data = node.data.lock().unwrap();
+        while data.blocks.last().unwrap().height < 20 {
+            crate::tests::mine(&mut data.blocks, None)?;
+        }
+    }
+    let db = oss::testing::TempDb::new();
+    let (url, oss) = oss::testing::spawn_oss(&node.url, &db.0)?;
+    oss.wait_built(20)?;
+    {
+        let mut data = node.data.lock().unwrap();
+        data.pruned_heights.extend(9..15);
+        data.zakura_pruning = true;
+    }
+    assert_eq!(remote(&dir, &url, SYNC)?["caught_up"], true);
+    assert_eq!(command(&dir, Operation::Balance)?["available_zat"], 100_000);
+    let to = note::address(&SpendingKey::from([9; 32]));
+    remote(
+        &dir,
+        &url,
+        Operation::Send {
+            to,
+            amount_zat: 40_000,
+        },
+    )?;
+    node.mine()?;
+    remote(&dir, &url, SYNC)?;
+    let balance = command(&dir, Operation::Balance)?;
+    assert_eq!(balance["available_zat"], 10_000, "{balance}");
+    Ok(())
+}
+
+#[test]
+fn remote_send_combines_two_notes() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    shield_each(&node, &dir, &[200_000, 300_000])?;
+    let db = oss::testing::TempDb::new();
+    let (url, _oss) = oss::testing::spawn_oss(&node.url, &db.0)?;
+    let own = command(&dir, Operation::Address)?["tachyon_address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    remote(
+        &dir,
+        &url,
+        Operation::Send {
+            to: own,
+            amount_zat: 150_000,
+        },
+    )?;
+    node.mine()?;
+    remote(&dir, &url, SYNC)?;
+    let balance = command(&dir, Operation::BalanceSummary)?;
+    assert_eq!(balance["available_zat"], 150_000, "{balance}");
+    assert_eq!(balance["notes"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn remote_sync_stops_at_an_oss_one_block_behind_the_node() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    init_wallet(&node, &dir)?;
+    let blocks = {
+        let mut data = node.data.lock().unwrap();
+        for _ in 0..3 {
+            crate::tests::mine(&mut data.blocks, None)?;
+        }
+        data.blocks.clone()
+    };
+    let (last, tip) = (blocks.last().unwrap().clone(), 11);
+    let lagging = oss::testing::FakeNode::start(blocks[..blocks.len() - 1].to_vec())?;
+    let db = oss::testing::TempDb::new();
+    let (url, oss) = oss::testing::spawn_oss(&lagging.url, &db.0)?;
+    oss.wait_built(tip - 1)?;
+    // After waiting 10 s for the OSS, the wallet syncs as far as it can.
+    let synced = remote(&dir, &url, SYNC)?;
+    assert_eq!(synced["height"], tip - 1, "{synced}");
+    assert_eq!(synced["caught_up"], false);
+    lagging.data().blocks.push(last);
+    oss.wait_built(tip)?;
+    let synced = remote(&dir, &url, SYNC)?;
+    assert_eq!(synced["height"], tip, "{synced}");
+    assert_eq!(synced["caught_up"], true);
     Ok(())
 }

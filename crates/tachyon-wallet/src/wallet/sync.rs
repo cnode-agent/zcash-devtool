@@ -7,6 +7,10 @@ use crate::{
     rpc::RpcError,
 };
 
+/// Remote mode: the OSS and the first height it archives. Tachyon blocks from
+/// that height up come from the OSS (design §4.3).
+pub(crate) type Archive<'a> = Option<(&'a Oss, u32)>;
+
 pub(super) fn epoch_start(height: u32, activation: u32) -> Result<u32> {
     let offset = height
         .checked_sub(activation)
@@ -14,11 +18,16 @@ pub(super) fn epoch_start(height: u32, activation: u32) -> Result<u32> {
     Ok(height - offset % EPOCH_SIZE)
 }
 
-pub(super) fn checkpoint(rpc: &Rpc, height: u32, activation: u32) -> Result<Block> {
+pub(super) fn checkpoint(
+    rpc: &Rpc,
+    archive: Archive,
+    height: u32,
+    activation: u32,
+) -> Result<Block> {
     rpc.control.stage(format!(
         "Loading trusted epoch checkpoint at height {height}…"
     ))?;
-    let block = fetch_block(rpc, height)?;
+    let block = fetch_block(rpc, archive, height)?;
     chain::validate_checkpoint(&block, activation)?;
     ensure!(
         rpc.hash(height)? == block.hash,
@@ -27,9 +36,15 @@ pub(super) fn checkpoint(rpc: &Rpc, height: u32, activation: u32) -> Result<Bloc
     Ok(block)
 }
 
-fn fetch_block(rpc: &Rpc, height: u32) -> Result<Block> {
-    rpc.block(height).with_context(|| format!(
-        "cannot obtain Tachyon evidence at height {height}; if it has been pruned, use an archive node (proof-service recovery is not implemented)"
+fn fetch_block(rpc: &Rpc, archive: Archive, height: u32) -> Result<Block> {
+    match archive {
+        Some((oss, from)) if height >= from => oss
+            .block(height)
+            .and_then(|block| rpc.with_transactions(block, true)),
+        _ => rpc.block(height),
+    }
+    .with_context(|| format!(
+        "cannot obtain Tachyon evidence at height {height}; if it has been pruned, use an archive node or an OSS that archived it"
     ))
 }
 
@@ -42,16 +57,14 @@ pub(crate) struct SyncCache {
 }
 
 impl SyncCache {
-    fn fetch(&mut self, rpc: &Rpc, height: u32) -> Result<Block> {
+    fn fetch(&mut self, rpc: &Rpc, archive: Archive, height: u32) -> Result<Block> {
         let hash = rpc.hash(height)?;
         if let Some(block) = self.blocks.get(&height)
             && block.hash == hash
         {
             return Ok(block.clone());
         }
-        let block = rpc.block(height).with_context(|| format!(
-            "cannot obtain Tachyon evidence at height {height}; if it has been pruned, use an archive node (proof-service recovery is not implemented)"
-        ))?;
+        let block = fetch_block(rpc, archive, height)?;
         ensure!(block.hash == hash, "Tachyon block changed during fetch");
         self.blocks.insert(height, block.clone());
         self.fetches += 1;
@@ -118,7 +131,7 @@ fn located_block(
     {
         return Ok(None);
     }
-    let block = fetch_block(rpc, height)?;
+    let block = fetch_block(rpc, None, height)?;
     // The subsequent contiguous sync validates the transitions from our
     // checkpoint. This lookup alone never makes a note spendable.
     ensure!(
@@ -181,9 +194,10 @@ pub(super) fn sync(
     max_blocks: u32,
     from_height: Option<u32>,
     control: &Control,
+    oss: Option<&Oss>,
 ) -> Result<Value> {
     let cache = std::sync::Arc::new(std::sync::Mutex::new(SyncCache::default()));
-    sync_with_cache(store, config, max_blocks, from_height, control, &cache)
+    sync_with_cache(store, config, max_blocks, from_height, control, &cache, oss)
 }
 
 pub(crate) fn sync_with_cache(
@@ -193,6 +207,7 @@ pub(crate) fn sync_with_cache(
     from_height: Option<u32>,
     control: &Control,
     cache: &std::sync::Arc<std::sync::Mutex<SyncCache>>,
+    oss: Option<&Oss>,
 ) -> Result<Value> {
     let rpc = rpc(config, control)?;
     let funding_address = transaction::funding_address(config.seed)?;
@@ -202,6 +217,14 @@ pub(crate) fn sync_with_cache(
         tip >= config.activation,
         "node tip precedes NuTachyon activation"
     );
+    // Remote mode syncs no further than the OSS has archived.
+    let (archive, synced_tip) = match oss {
+        Some(oss) => {
+            let (from, oss_tip) = oss.archive(tip, &config.genesis)?;
+            (Some((oss, from)), oss_tip.min(tip))
+        }
+        None => (None, tip),
+    };
     control.stage("Loading saved chain inputs…")?;
     let initial_start = store.first_height()?.context("wallet has no checkpoint")?;
     let original_last = store.tip()?.context("wallet has no checkpoint")?;
@@ -254,7 +277,7 @@ pub(crate) fn sync_with_cache(
         // Re-bootstrap on the configured node after a reorg crossing it.
         reorg = true;
         let height = epoch_start(initial_start.min(tip), config.activation)?;
-        let block = checkpoint(&rpc, height, config.activation)?;
+        let block = checkpoint(&rpc, archive, height, config.activation)?;
         store.clear_chain()?;
         store.put_block(&block)?;
         first = height;
@@ -282,7 +305,7 @@ pub(crate) fn sync_with_cache(
     }
     let backfill = needed_start < first;
     let mut previous = if backfill {
-        let block = checkpoint(&rpc, needed_start, config.activation)?;
+        let block = checkpoint(&rpc, archive, needed_start, config.activation)?;
         store.put_block(&block)?;
         store.clear_funding_snapshot()?;
         // Keep the cached suffix on disk and reconnect it as the bounded
@@ -292,7 +315,7 @@ pub(crate) fn sync_with_cache(
         Some(last)
     };
     let start = previous.as_ref().expect("sync has a checkpoint").height;
-    let stop = start.saturating_add(max_blocks).min(tip);
+    let stop = start.saturating_add(max_blocks).min(synced_tip);
     control.stage(format!(
         "Syncing heights {}–{stop} (node tip {tip})…",
         start.saturating_add(1).min(stop)
@@ -305,10 +328,10 @@ pub(crate) fn sync_with_cache(
             } else {
                 store.rewind(height - 1)?;
                 reorg = true;
-                cache.lock().unwrap().fetch(&rpc, height)?
+                cache.lock().unwrap().fetch(&rpc, archive, height)?
             }
         } else {
-            cache.lock().unwrap().fetch(&rpc, height)?
+            cache.lock().unwrap().fetch(&rpc, archive, height)?
         };
         control.stage(format!("Validating block {height}…"))?;
         cache

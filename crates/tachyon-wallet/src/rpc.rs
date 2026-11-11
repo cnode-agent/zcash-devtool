@@ -1,7 +1,7 @@
 //! Direct, bounded Zakura JSON-RPC. This wallet does not use lightwalletd.
 
 use anyhow::{Context, Result, bail, ensure};
-use oss_core::{ErrorCode, NotReadyData, SpentData};
+use oss_core::{BlockParams, ErrorCode, InfoParams, InfoResult, NotReadyData, SpentData};
 use reqwest::{Client, Url};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -290,6 +290,31 @@ impl Oss {
                 None => return Err(error.context("OSS request failed")),
             }
         }
+    }
+
+    /// Waits up to 10 s for the OSS tip to reach the node's (design §4.3).
+    /// Returns the first height of its archive and its tip.
+    pub fn archive(&self, node_tip: u32, genesis: &str) -> Result<(u32, u32)> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let info: InfoResult = self.call("oss_info", InfoParams {})?;
+            ensure!(
+                info.genesis_hash.eq_ignore_ascii_case(genesis),
+                "the OSS follows another chain (genesis {})",
+                info.genesis_hash
+            );
+            if info.tip.height >= node_tip || Instant::now() >= deadline {
+                return Ok((info.archive_from_height, info.tip.height));
+            }
+            self.rpc.sleep(Duration::from_millis(250))?;
+        }
+    }
+
+    /// The archived `gettachyonblock` JSON, kept after the node prunes it.
+    pub fn block(&self, height: u32) -> Result<Block> {
+        let block: Block = self.call("oss_block", BlockParams { height })?;
+        ensure!(block.height == height, "oss_block height mismatch");
+        Ok(block)
     }
 }
 

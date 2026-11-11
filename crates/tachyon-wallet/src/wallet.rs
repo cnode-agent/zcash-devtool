@@ -240,7 +240,7 @@ impl Command {
                 "wallet birthday is above the node tip"
             );
             let start = sync::epoch_start(birthday_height, activation_height)?;
-            let checkpoint = sync::checkpoint(&rpc, start, activation_height)?;
+            let checkpoint = sync::checkpoint(&rpc, None, start, activation_height)?;
             let identity = Sha256::new()
                 .chain_update(bytes32(&genesis)?)
                 .chain_update(activation_height.to_le_bytes())
@@ -344,7 +344,7 @@ impl Command {
             Operation::Sync {
                 max_blocks,
                 from_height,
-            } => sync(&store, &config, max_blocks, from_height, control)?,
+            } => sync(&store, &config, max_blocks, from_height, control, oss)?,
             Operation::Receive {
                 receipt,
                 txid,
@@ -438,7 +438,7 @@ impl Command {
             }
             Operation::Submit { txid } => {
                 ensure!(
-                    sync(&store, &config, 1000, None, control)?["caught_up"] == true,
+                    sync(&store, &config, 1000, None, control, oss)?["caught_up"] == true,
                     "run sync until caught up before submitting"
                 );
                 let pending = find_pending(&store, &txid)?;
@@ -540,6 +540,7 @@ impl SyncManyCommand {
                                 None,
                                 control,
                                 &cache,
+                                None,
                             )?;
                             store.commit()?;
                             Ok((name, result))
@@ -883,7 +884,7 @@ fn pay(
         tip
     } else {
         ensure!(
-            sync(store, config, 1000, None, control)?["caught_up"] == true,
+            sync(store, config, 1000, None, control, oss)?["caught_up"] == true,
             "run sync until caught up before creating transactions"
         );
         store.tip()?.context("wallet has not synced")?
