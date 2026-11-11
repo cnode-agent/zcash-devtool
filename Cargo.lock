@@ -449,6 +449,7 @@ dependencies = [
  "compression-core",
  "futures-io",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -577,10 +578,13 @@ checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -588,10 +592,15 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -610,6 +619,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -1304,6 +1314,7 @@ dependencies = [
  "compression-core",
  "flate2",
  "liblzma",
+ "memchr",
  "zstd",
  "zstd-safe",
 ]
@@ -4766,6 +4777,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "oss"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "clap",
+ "hex",
+ "oss-core",
+ "ragu",
+ "ragu_circuits",
+ "ragu_core",
+ "rand 0.10.2",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "zakura-pasta-curves 1.2.0",
+ "zakura-udon",
+ "zcash_tachyon",
+]
+
+[[package]]
 name = "oss-core"
 version = "0.1.0"
 dependencies = [
@@ -6842,6 +6878,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7354,6 +7401,7 @@ dependencies = [
  "clap",
  "ff 0.14.0",
  "hex",
+ "oss",
  "oss-core",
  "ragu",
  "ragu_circuits",
@@ -8853,12 +8901,17 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
+ "async-compression",
  "bitflags 2.13.1",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
@@ -8883,6 +8936,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

@@ -3,14 +3,16 @@
 
 use std::ops::Range;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use oss_core::{
-    MAX_UNSPENT_NULLIFIERS, Pcd, SpanBuilder, Spans, build_epoch, pcd_from_bytes, pcd_to_bytes,
-    profile_of, prove_unspent, trivial, verify_pcd,
+    AnchorSpansParams, AnchorSpansResult, BucketParams, BucketResult, EpochParams, EpochResult,
+    EvidenceStatus, MAX_UNSPENT_NULLIFIERS, Pcd, SpanBuilder, Spans, UnspentParams, UnspentResult,
+    build_epoch, bytes32, pcd_from_bytes, pcd_from_hex, pcd_to_bytes, profile_of, prove_unspent,
+    trivial, verify_pcd,
 };
 use udon::field::Field;
 use zcash_tachyon::{
-    Anchor, EpochIndex, Note, QrDiscriminant, Tachygram,
+    Anchor, EpochIndex, Note, QrDiscriminant, QrProfile, Tachygram,
     keys::private::SpendingKey,
     nullifier::{NF_DERIVATION_WIDTH, Nullifier},
     pasta::Fp,
@@ -21,13 +23,83 @@ use zcash_tachyon::{
 use crate::{
     chain::{self, anchor, anchor_hex},
     control::Control,
+    rpc::Oss,
     store::ChainData,
 };
+
+/// Other tachyon or ragu revs are another PCD application (design §4.1).
+const REVS: &str = "; check that oss_info.proofSystem names this wallet's tachyon and ragu revs";
 
 /// Where buckets, unspent segments and spans come from (design §4.6).
 pub enum Prover<'a> {
     /// Self-prove from the wallet's synced chain, with fixed `R0 = 1`.
     Local(&'a ChainData<'a>),
+    /// Ask an OSS, and check every answer against the wallet's synced chain.
+    Remote(&'a Oss, &'a ChainData<'a>),
+}
+
+/// An `oss_anchorspans` answer for `from`, decoded: every chunk verifies and
+/// every start indexes a chunk. A malformed answer is an error, not a panic.
+pub(crate) fn checked_spans(from: &[Anchor], answer: AnchorSpansResult) -> Result<Spans> {
+    let AnchorSpansResult {
+        target,
+        chunks,
+        start,
+        ..
+    } = answer;
+    let target = anchor(&target)?;
+    ensure!(
+        start.len() == from.len(),
+        "the OSS returned {} span starts for {} anchors",
+        start.len(),
+        from.len()
+    );
+    let chunks = chunks
+        .iter()
+        .map(|chunk| {
+            let span = pcd_from_hex::<pool::AnchorSpan>(chunk)?;
+            ensure!(
+                verify_pcd(&span)?,
+                "an OSS anchor span does not verify{REVS}"
+            );
+            Ok(span)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let start = start
+        .into_iter()
+        .zip(from)
+        .map(|(s, from)| {
+            let s = s.map(usize::try_from).transpose()?;
+            ensure!(
+                s.map_or(*from == target, |s| s < chunks.len()),
+                "the OSS spans do not lift {} to {}",
+                anchor_hex(*from),
+                anchor_hex(target)
+            );
+            Ok(s)
+        })
+        .collect::<Result<_>>()?;
+    Ok((target, chunks, start))
+}
+
+/// Whether `bucket` is `epoch`'s bucket of `profile` under `r0`, and sits on
+/// this chain's entry anchors. Check [`verify_pcd`] too.
+fn on_chain(
+    chain: &ChainData<'_>,
+    bucket: &Pcd<qr::QrBucket>,
+    epoch: u32,
+    r0: QrDiscriminant,
+    profile: QrProfile,
+) -> Result<bool> {
+    let (e, start, next, disc, p, _) = *bucket.data();
+    Ok((e, start, next, disc, p)
+        == (
+            EpochIndex::new(epoch),
+            chain.epoch_sentinel(epoch)?,
+            chain.epoch_sentinel(epoch + 1)?,
+            r0,
+            profile,
+        ))
 }
 
 impl Prover<'_> {
@@ -39,7 +111,38 @@ impl Prover<'_> {
         nfs: &[Nullifier],
         control: &Control,
     ) -> Result<Pcd<pool::ArbitraryUnspent>> {
-        let Self::Local(chain) = self;
+        let chain = match self {
+            Self::Local(chain) => chain,
+            Self::Remote(oss, chain) => {
+                control.stage(format!(
+                    "Requesting unspent evidence for {} epochs from {epoch_start}…",
+                    nfs.len()
+                ))?;
+                let UnspentResult { pcd, .. } = oss.call(
+                    "oss_unspent",
+                    UnspentParams {
+                        epoch_start,
+                        nullifiers: nfs
+                            .iter()
+                            .map(|nf| hex::encode(Fp::from(*nf).to_bytes()))
+                            .collect(),
+                    },
+                )?;
+                let segment = pcd_from_hex::<pool::ArbitraryUnspent>(&pcd)?;
+                let next = epoch_start + u32::try_from(nfs.len())?;
+                let expected = (
+                    chain.epoch_sentinel(epoch_start)?,
+                    EpochIndex::new(epoch_start),
+                    EpochIndex::new(next),
+                    chain.epoch_sentinel(next)?,
+                );
+                ensure!(
+                    *segment.data() == expected && verify_pcd(&segment)?,
+                    "the OSS unspent segment for epochs {epoch_start}..{next} does not verify on the synced chain{REVS}"
+                );
+                return Ok(segment);
+            }
+        };
         for (epoch, nf) in (epoch_start..).zip(nfs) {
             ensure!(
                 !chain.published(Tachygram::from(*nf))?,
@@ -62,23 +165,41 @@ impl Prover<'_> {
         value: Fp,
         control: &Control,
     ) -> Result<Pcd<qr::QrBucket>> {
-        let Self::Local(chain) = self;
+        let chain = match self {
+            Self::Local(chain) => chain,
+            Self::Remote(oss, chain) => {
+                control.stage(format!("Requesting closed epoch {epoch} bucket…"))?;
+                let EpochResult { evidence, .. } = oss.call("oss_epoch", EpochParams { epoch })?;
+                let (EvidenceStatus::Ready, Some(r0), Some(profiles)) =
+                    (evidence.status, evidence.discriminant, evidence.profiles)
+                else {
+                    bail!(
+                        "OSS not ready: epoch {epoch} evidence is {:?}",
+                        evidence.status
+                    );
+                };
+                let r0 = QrDiscriminant(
+                    Fp::from_bytes(bytes32(&r0)?).context("invalid OSS discriminant")?,
+                );
+                let profiles: Vec<_> = profiles.iter().map(|p| p.profile).collect();
+                let profile = profile_of(value, r0, &profiles)
+                    .context("no OSS bucket on the routing path")?;
+                let BucketResult { pcd } =
+                    oss.call("oss_bucket", BucketParams { epoch, profile })?;
+                let bucket = pcd_from_hex::<qr::QrBucket>(&pcd)?;
+                ensure!(
+                    on_chain(chain, &bucket, epoch, r0, profile)? && verify_pcd(&bucket)?,
+                    "the OSS bucket of epoch {epoch} does not verify on the synced chain{REVS}"
+                );
+                return Ok(bucket);
+            }
+        };
         let r0 = QrDiscriminant(Fp::ONE);
         // A row counts only if it verifies and sits on this chain's entry anchors.
         if let Some(profile) = profile_of(value, r0, &chain.bucket_profiles(epoch)?)
             && let Some(bytes) = chain.bucket_proof(epoch, profile)?
             && let Ok(bucket) = pcd_from_bytes::<qr::QrBucket>(&bytes)
-            && {
-                let (e, start, next, disc, p, _) = *bucket.data();
-                (e, start, next, disc, p)
-                    == (
-                        EpochIndex::new(epoch),
-                        chain.epoch_sentinel(epoch)?,
-                        chain.epoch_sentinel(epoch + 1)?,
-                        r0,
-                        profile,
-                    )
-            }
+            && on_chain(chain, &bucket, epoch, r0, profile)?
             && verify_pcd(&bucket).unwrap_or(false)
         {
             control.record_cache("bucket", true, u64::try_from(bytes.len())?);
@@ -117,7 +238,15 @@ impl Prover<'_> {
 
     /// Spans lifting every anchor of `from` to one target, the synced tip.
     pub fn spans(&self, from: &[Anchor], control: &Control) -> Result<Spans> {
-        let Self::Local(chain) = self;
+        let chain = match self {
+            Self::Local(chain) => chain,
+            Self::Remote(oss, _) => {
+                control.stage("Requesting anchor spans…")?;
+                let from_hex = from.iter().map(|a| anchor_hex(*a)).collect();
+                let answer = oss.call("oss_anchorspans", AnchorSpansParams { from: from_hex })?;
+                return checked_spans(from, answer);
+            }
+        };
         let tip = chain.tip()?;
         let epoch = tip.epoch;
         let blocks: Vec<_> = chain

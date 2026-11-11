@@ -10,6 +10,7 @@ use zcash_tachyon::{
     constants::EPOCH_SIZE, keys::private::SpendingKey,
 };
 
+use oss::testing::{FakeNode, OssHandle, TempDb, spawn_oss};
 use oss_core::TachyonStamp as Stamp;
 
 use crate::{
@@ -17,6 +18,8 @@ use crate::{
     control::Control,
     note::{self, Receipt},
     proofs::Prover,
+    rpc::Oss,
+    store::ChainData,
     transaction::{self, FEE, Funding, Payment},
 };
 
@@ -24,7 +27,149 @@ pub(crate) const SEED: [u8; 32] = [7; 32];
 pub(crate) const NETWORK: &str = "test-network";
 
 fn build(payment: Payment<'_>) -> Result<Transaction> {
-    transaction::build(payment, &Control::new(true))
+    let ChainData::Blocks(blocks) = payment.blocks else {
+        unreachable!("test payments carry their blocks")
+    };
+    transaction::build(payment, &Prover::Local(&blocks.into()), &Control::new(true))
+}
+
+/// An OSS following a fake node, for the remote twins of closed-epoch tests.
+struct Remote {
+    // Fields drop in order: stop the OSS before its node.
+    oss: OssHandle,
+    node: FakeNode,
+    client: Oss,
+    _db: TempDb,
+}
+
+impl Remote {
+    fn start(blocks: &[Block]) -> Result<Self> {
+        let db = TempDb::new();
+        let node = FakeNode::start(blocks.to_vec())?;
+        let (url, oss) = spawn_oss(&node.url, &db.0)?;
+        Ok(Self {
+            oss,
+            node,
+            client: Oss::new(&url, None, &Control::new(true))?,
+            _db: db,
+        })
+    }
+
+    /// Serves `blocks` from their first height up, and waits until the OSS
+    /// has built their tip and sealed every closed epoch.
+    fn follow(&self, blocks: &[Block]) -> Result<()> {
+        {
+            let mut data = self.node.data();
+            data.blocks.retain(|b| b.height < blocks[0].height);
+            data.blocks.extend_from_slice(blocks);
+        }
+        let tip = blocks.last().unwrap();
+        if let Some(closed) = tip.epoch.checked_sub(1) {
+            self.oss.wait_ready(closed)?;
+        }
+        self.oss.wait_built(tip.height)
+    }
+}
+
+/// A prover for `chain`: local, or `oss` once it has followed `blocks`.
+fn prover_for<'a>(
+    chain: &'a ChainData<'a>,
+    oss: Option<&'a Remote>,
+    blocks: &[Block],
+) -> Result<Prover<'a>> {
+    let Some(oss) = oss else {
+        return Ok(Prover::Local(chain));
+    };
+    oss.follow(blocks)?;
+    Ok(Prover::Remote(&oss.client, chain))
+}
+
+/// Spends `receipt` at the tip of `blocks`, proving closed epochs locally or
+/// through `oss`.
+fn spend(blocks: &[Block], receipt: &Receipt, oss: Option<&Remote>) -> Result<()> {
+    let chain = ChainData::Blocks(blocks);
+    let sent = transaction::build(
+        Payment {
+            seed: SEED,
+            blocks: blocks.into(),
+            spends: vec![receipt],
+            funding: None,
+            outputs: &[own(950_000)],
+            transparent_output: None,
+            expiry: blocks.last().unwrap().height + 20,
+        },
+        &prover_for(&chain, oss, blocks)?,
+        &Control::new(true),
+    )?;
+    transaction::verify_for_test(&sent, None)
+}
+
+#[test]
+fn oss_not_ready_is_retried_then_reported() -> Result<()> {
+    let mut oss = Remote::start(&[genesis()])?;
+    oss.client.patience = std::time::Duration::from_millis(2500);
+    let started = std::time::Instant::now();
+    // Epoch 0 is open, so the OSS answers NotReady with retryAfterMs = 1000.
+    let error = oss
+        .client
+        .call::<oss_core::UnspentResult>(
+            "oss_unspent",
+            oss_core::UnspentParams {
+                epoch_start: 0,
+                nullifiers: vec![hex::encode(Fp::ONE.to_bytes())],
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("OSS not ready"), "{error}");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    Ok(())
+}
+
+#[test]
+fn malformed_oss_spans_are_errors() {
+    let from = Anchor::default();
+    let answer = |target: Anchor, start: Vec<Option<u32>>| oss_core::AnchorSpansResult {
+        epoch: 0,
+        target: chain::anchor_hex(target),
+        chunks: vec![],
+        start,
+    };
+    let checked = |target, start| crate::proofs::checked_spans(&[from], answer(target, start));
+    assert!(checked(from, vec![None]).is_ok());
+    assert!(checked(from, vec![]).is_err()); // One start per anchor.
+    assert!(checked(from, vec![Some(0)]).is_err()); // No such chunk.
+    assert!(checked(Anchor(Fp::ONE), vec![None]).is_err()); // Not at the target.
+}
+
+/// Each `fn(remote: bool)` body as a local test and its remote twin.
+macro_rules! twins {
+    ($($local:ident, $remote:ident => $body:ident;)*) => {$(
+        #[test]
+        fn $local() -> Result<()> {
+            $body(false)
+        }
+        #[test]
+        fn $remote() -> Result<()> {
+            $body(true)
+        }
+    )*};
+}
+
+twins! {
+    old_note_spends_after_populated_and_empty_closed_epochs,
+    old_note_spends_after_populated_and_empty_closed_epochs_remote => old_note_spends;
+    checkpoint_history_supports_spends_before_and_after_creation_epoch_closes,
+    checkpoint_history_supports_spends_before_and_after_creation_epoch_closes_remote
+        => checkpoint_history_spends;
+    spends_after_epoch_with_more_tachygrams_than_polynomial_capacity,
+    spends_after_epoch_with_more_tachygrams_than_polynomial_capacity_remote
+        => spends_after_large_epoch;
+    cached_spendability_advances_only_across_new_epochs,
+    cached_spendability_advances_only_across_new_epochs_remote => cached_spendability;
+    spent_note_cannot_produce_closed_epoch_absence_evidence,
+    spent_note_cannot_produce_closed_epoch_absence_evidence_remote => spent_note_has_no_evidence;
+    spent_note_cannot_hide_in_another_routed_bucket,
+    spent_note_cannot_hide_in_another_routed_bucket_remote => spent_note_cannot_hide;
 }
 
 pub(crate) fn genesis() -> Block {
@@ -332,8 +477,7 @@ fn shield_transfer_change_and_unshield_roundtrip_with_valid_authorization() -> R
     Ok(())
 }
 
-#[test]
-fn old_note_spends_after_populated_and_empty_closed_epochs() -> Result<()> {
+fn old_note_spends(remote: bool) -> Result<()> {
     let mut blocks = vec![genesis()];
     let receipt = own(1_000_000);
     let tx = shield(&blocks, &receipt)?;
@@ -342,25 +486,17 @@ fn old_note_spends_after_populated_and_empty_closed_epochs() -> Result<()> {
     while blocks.last().unwrap().epoch < 2 {
         mine(&mut blocks, None)?;
     }
-    let sent = build(Payment {
-        seed: SEED,
-        blocks: (&blocks).into(),
-        spends: vec![&receipt],
-        funding: None,
-        outputs: &[own(950_000)],
-        transparent_output: None,
-        expiry: blocks.last().unwrap().height + 20,
-    })?;
-    transaction::verify_for_test(&sent, None)?;
-    Ok(())
+    let oss = remote.then(|| Remote::start(&blocks)).transpose()?;
+    spend(&blocks, &receipt, oss.as_ref())
 }
 
-#[test]
-fn checkpoint_history_supports_spends_before_and_after_creation_epoch_closes() -> Result<()> {
+fn checkpoint_history_spends(remote: bool) -> Result<()> {
     let mut blocks = vec![genesis()];
     while blocks.last().unwrap().epoch < 1 {
         mine(&mut blocks, None)?;
     }
+    // The OSS archives from activation; the wallet does not need to.
+    let oss = remote.then(|| Remote::start(&blocks)).transpose()?;
     let checkpoint = blocks.last().unwrap().clone();
     chain::validate_checkpoint(&checkpoint, 8)?;
     assert!(chain::validate(&checkpoint, None, 8).is_err());
@@ -372,16 +508,7 @@ fn checkpoint_history_supports_spends_before_and_after_creation_epoch_closes() -
         while blocks.last().unwrap().epoch < target_epoch {
             mine(&mut blocks, None)?;
         }
-        let sent = build(Payment {
-            seed: SEED,
-            blocks: (&blocks).into(),
-            spends: vec![&receipt],
-            funding: None,
-            outputs: &[own(950_000)],
-            transparent_output: None,
-            expiry: blocks.last().unwrap().height + 20,
-        })?;
-        transaction::verify_for_test(&sent, None)?;
+        spend(&blocks, &receipt, oss.as_ref())?;
     }
     Ok(())
 }
@@ -433,8 +560,7 @@ fn populate_epoch(blocks: &mut Vec<Block>, count: usize) -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn spends_after_epoch_with_more_tachygrams_than_polynomial_capacity() -> Result<()> {
+fn spends_after_large_epoch(remote: bool) -> Result<()> {
     let mut blocks = vec![genesis()];
     let key = SpendingKey::from(SEED);
     let older = own(1_000_000);
@@ -463,18 +589,10 @@ fn spends_after_epoch_with_more_tachygrams_than_polynomial_capacity() -> Result<
         mine(&mut blocks, None)?;
     }
     assert_eq!(blocks.last().unwrap().height, 8200);
+    let oss = remote.then(|| Remote::start(&blocks)).transpose()?;
     // Exercise both routed creation and lifting an older note through a large epoch.
     for receipt in [&receipt, &older] {
-        let sent = build(Payment {
-            seed: SEED,
-            blocks: (&blocks).into(),
-            spends: vec![receipt],
-            funding: None,
-            outputs: &[own(950_000)],
-            transparent_output: None,
-            expiry: blocks.last().unwrap().height + 20,
-        })?;
-        transaction::verify_for_test(&sent, None)?;
+        spend(&blocks, receipt, oss.as_ref())?;
     }
     Ok(())
 }
@@ -573,8 +691,7 @@ fn note_spend_tracking_updates_from_new_blocks_and_rewinds() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn cached_spendability_advances_only_across_new_epochs() -> Result<()> {
+fn cached_spendability(remote: bool) -> Result<()> {
     let directory = tempfile::tempdir()?;
     #[cfg(unix)]
     {
@@ -603,8 +720,9 @@ fn cached_spendability_advances_only_across_new_epochs() -> Result<()> {
     for block in &blocks {
         store.put_block(block)?;
     }
-    let chain = crate::store::ChainData::Store(&store);
-    let prover = Prover::Local(&chain);
+    let oss = remote.then(|| Remote::start(&blocks)).transpose()?;
+    let chain = ChainData::Store(&store);
+    let prover = prover_for(&chain, oss.as_ref(), &blocks)?;
     let control = Control::new(true);
     let key = SpendingKey::from(SEED);
     let first = crate::proofs::spendable(&chain, &prover, &key, receipt.note()?, &control)?;
@@ -614,10 +732,10 @@ fn cached_spendability_advances_only_across_new_epochs() -> Result<()> {
     assert!(!cached.is_empty());
     let second = crate::proofs::spendable(&chain, &prover, &key, receipt.note()?, &control)?;
     assert_eq!(second.data(), first.data());
-    // The payment cached every bucket of both closed epochs.
+    // A local payment cached every bucket of both closed epochs.
     assert_eq!(
         store.bucket_profiles(0)?.len() + store.bucket_profiles(1)?.len(),
-        2
+        if remote { 0 } else { 2 }
     );
     store.put_spendable_proof(&receipt.id()?, &[0u8; 32])?;
     let recovered = crate::proofs::spendable(&chain, &prover, &key, receipt.note()?, &control)?;
@@ -631,6 +749,9 @@ fn cached_spendability_advances_only_across_new_epochs() -> Result<()> {
             store.put_block(block)?;
         }
     }
+    if let Some(oss) = &oss {
+        oss.follow(&blocks)?;
+    }
     let third = crate::proofs::spendable(&chain, &prover, &key, receipt.note()?, &control)?;
     assert!(third.data().1 > second.data().1);
     assert_eq!(
@@ -641,8 +762,7 @@ fn cached_spendability_advances_only_across_new_epochs() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn spent_note_cannot_produce_closed_epoch_absence_evidence() -> Result<()> {
+fn spent_note_has_no_evidence(remote: bool) -> Result<()> {
     let mut blocks = vec![genesis()];
     let receipt = own(1_000_000);
     let funded = shield(&blocks, &receipt)?;
@@ -660,22 +780,22 @@ fn spent_note_cannot_produce_closed_epoch_absence_evidence() -> Result<()> {
     while blocks.last().unwrap().epoch < 1 {
         mine(&mut blocks, None)?;
     }
-    let chain = crate::store::ChainData::Blocks(&blocks);
-    assert!(
-        crate::proofs::spendable(
-            &chain,
-            &Prover::Local(&chain),
-            &SpendingKey::from(SEED),
-            receipt.note()?,
-            &Control::new(true)
-        )
-        .is_err()
-    );
+    let oss = remote.then(|| Remote::start(&blocks)).transpose()?;
+    let chain = ChainData::Blocks(&blocks);
+    let error = crate::proofs::spendable(
+        &chain,
+        &prover_for(&chain, oss.as_ref(), &blocks)?,
+        &SpendingKey::from(SEED),
+        receipt.note()?,
+        &Control::new(true),
+    )
+    .err()
+    .expect("a spent note has no absence evidence");
+    assert!(error.to_string().contains("note is spent"), "{error}");
     Ok(())
 }
 
-#[test]
-fn spent_note_cannot_hide_in_another_routed_bucket() -> Result<()> {
+fn spent_note_cannot_hide(remote: bool) -> Result<()> {
     let mut blocks = vec![genesis()];
     let receipt = own(1_000_000);
     let funded = shield(&blocks, &receipt)?;
@@ -694,12 +814,14 @@ fn spent_note_cannot_hide_in_another_routed_bucket() -> Result<()> {
     while blocks.last().unwrap().epoch < 1 {
         mine(&mut blocks, None)?;
     }
-    let chain = crate::store::ChainData::Blocks(&blocks);
-    let prover = Prover::Local(&chain);
+    let oss = remote.then(|| Remote::start(&blocks)).transpose()?;
+    let chain = ChainData::Blocks(&blocks);
+    let prover = prover_for(&chain, oss.as_ref(), &blocks)?;
     let (key, note, control) = (SpendingKey::from(SEED), receipt.note()?, Control::new(true));
+    // The wallet's own tachygram index, or the OSS's, marks the note spent.
     let error = crate::proofs::spendable(&chain, &prover, &key, note, &control)
         .err()
-        .expect("the local tachygram index marks the note spent");
+        .expect("a spent note is not spendable");
     assert!(error.to_string().contains("note is spent"), "{error}");
     // Below that index check, the proof still refuses: the nullifier is tested
     // against its own routed bucket, which holds it.

@@ -9,13 +9,13 @@ publish = false
 [dependencies]
 anyhow = "1"
 bs58 = { version = "0.5", features = ["check"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 ff = "0.14"
 hex = "0.4"
 pasta_curves = { package = "zakura-pasta-curves", version = "1.0.1" }
 rand = { version = "0.10", features = ["std_rng"] }
 udon = { package = "zakura-udon", version = "0.1.0", features = ["traits"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 tokio = { version = "1", features = ["rt", "macros", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 rusqlite = "0.37"
@@ -41,6 +41,8 @@ oss-core = { path = "../../../../oss/crates/oss-core" }
 
 [dev-dependencies]
 tempfile = "3"
+# The OSS server and its fake node, for remote-mode tests.
+oss = { path = "../../../../oss/crates/oss", features = ["testing"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nutachyon"))'] }

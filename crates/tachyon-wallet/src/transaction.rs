@@ -95,7 +95,7 @@ pub struct Payment<'a> {
     pub expiry: u32,
 }
 
-pub fn build(payment: Payment<'_>, control: &Control) -> Result<Transaction> {
+pub fn build(payment: Payment<'_>, prover: &Prover<'_>, control: &Control) -> Result<Transaction> {
     control.check()?;
     let Payment {
         seed,
@@ -137,11 +137,10 @@ pub fn build(payment: Payment<'_>, control: &Control) -> Result<Transaction> {
     );
     let key = SpendingKey::from(seed);
     let mut rng = rand::rng();
-    let prover = Prover::Local(&blocks);
     let mut prepared = Vec::with_capacity(spends.len());
     for receipt in spends {
         let note = receipt.note()?;
-        let spendable = proofs::spendable(&blocks, &prover, &key, note, control)?;
+        let spendable = proofs::spendable(&blocks, prover, &key, note, control)?;
         let secret = proofs::secret(&key, note, control)?;
         prepared.push((note, secret, spendable));
     }

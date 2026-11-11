@@ -5,8 +5,9 @@ use crate::{
     control::{self, Control},
     funding_balance::{AddressUtxos, COINBASE_MATURITY},
     note::{self, Locator, Receipt},
-    rpc::Rpc,
-    store::{Config, Pending, Store, StoredOperation, write_private},
+    proofs::Prover,
+    rpc::{Oss, Rpc},
+    store::{ChainData, Config, Pending, Store, StoredOperation, write_private},
     transaction::{self, FEE, Funding, Payment},
 };
 use anyhow::{Context, Result, ensure};
@@ -41,6 +42,13 @@ pub struct Command {
     /// Suppress progress on stderr (errors and interruption notices remain visible).
     #[arg(long, short = 'q', global = true)]
     quiet: bool,
+    /// Sync and prove closed epochs through this Oblivious Synchronization
+    /// Service. Without it, the wallet proves everything itself.
+    #[arg(long, global = true, env = "TACHYON_OSS_URL")]
+    oss_url: Option<String>,
+    /// Cookie file for the OSS's HTTP Basic auth.
+    #[arg(long, global = true, env = "TACHYON_OSS_COOKIE")]
+    oss_cookie_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Operation,
 }
@@ -275,6 +283,11 @@ impl Command {
         };
         let config = store.config()?;
         let key = SpendingKey::from(config.seed);
+        let oss = self
+            .oss_url
+            .map(|url| Oss::new(&url, self.oss_cookie_file, control))
+            .transpose()?;
+        let oss = oss.as_ref();
         let result = match self.command {
             Operation::Init { .. } => unreachable!("handled above"),
             Operation::Address => addresses(&config)?,
@@ -455,6 +468,7 @@ impl Command {
                     self.operation_id.as_deref(),
                     self.expected_tip.as_deref(),
                     control,
+                    oss,
                 );
             }
         };
@@ -837,6 +851,7 @@ fn pay(
     operation_id: Option<&str>,
     expected_tip: Option<&str>,
     control: &Control,
+    oss: Option<&Oss>,
 ) -> Result<Value> {
     let request = payment_request(&operation)?;
     if let Some(id) = operation_id
@@ -1039,6 +1054,11 @@ fn pay(
             expiry,
         )?
     } else {
+        let chain = ChainData::from(store);
+        let prover = match oss {
+            Some(oss) => Prover::Remote(oss, &chain),
+            None => Prover::Local(&chain),
+        };
         transaction::build(
             Payment {
                 seed: config.seed,
@@ -1049,6 +1069,7 @@ fn pay(
                 transparent_output,
                 expiry,
             },
+            &prover,
             control,
         )?
     };

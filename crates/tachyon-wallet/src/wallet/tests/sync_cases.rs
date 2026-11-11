@@ -330,6 +330,7 @@ fn old_receipt_backfills_its_epoch_resumes_a_gap_and_reuses_cached_suffix() -> R
             transparent_output: None,
             expiry: start + 20,
         },
+        &Prover::Local(&(&blocks).into()),
         &Control::new(true),
     )?;
     transaction::verify_for_test(&sent, None)?;
@@ -417,6 +418,8 @@ fn missing_history_and_cancelled_backfill_preserve_wallet_and_checkpoint() -> Re
             quiet: true,
             operation_id: None,
             expected_tip: None,
+            oss_url: None,
+            oss_cookie_file: None,
             command: operation()
         }
         .execute_with_control(&control)

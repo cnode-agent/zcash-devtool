@@ -302,6 +302,8 @@ fn command_with_id(dir: &std::path::Path, command: Operation, id: Option<&str>) 
         operation_id: id.map(str::to_owned),
         expected_tip: None,
         quiet: true,
+        oss_url: None,
+        oss_cookie_file: None,
         command,
     }
     .execute()
@@ -499,6 +501,8 @@ fn expected_tip_skips_redundant_sync_and_rejects_stale_tip() -> Result<()> {
         operation_id: None,
         expected_tip: Some(tip.clone()),
         quiet: true,
+        oss_url: None,
+        oss_cookie_file: None,
         command: Operation::Send {
             to: note::address(&SpendingKey::from([9; 32])),
             amount_zat: 50_000,
@@ -524,6 +528,8 @@ fn expected_tip_skips_redundant_sync_and_rejects_stale_tip() -> Result<()> {
         operation_id: None,
         expected_tip: Some(hex::encode([0; 32])),
         quiet: true,
+        oss_url: None,
+        oss_cookie_file: None,
         command: Operation::Send {
             to: note::address(&SpendingKey::from([9; 32])),
             amount_zat: 50_000,
@@ -1438,6 +1444,8 @@ fn cancelled_sync_rolls_back_blocks_and_funding_snapshot_and_can_resume() -> Res
         operation_id: None,
         expected_tip: None,
         quiet: true,
+        oss_url: None,
+        oss_cookie_file: None,
         command: Operation::Sync {
             max_blocks: 1000,
             from_height: None,
@@ -1467,6 +1475,8 @@ fn cancelled_broadcast_retains_signed_payment_and_reservation() -> Result<()> {
         operation_id: Some("cancelled-payment".into()),
         expected_tip: None,
         quiet: true,
+        oss_url: None,
+        oss_cookie_file: None,
         command: transparent_send(&address, 100_000),
     }
     .execute_with_control(&control)

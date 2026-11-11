@@ -1,12 +1,16 @@
 //! Direct, bounded Zakura JSON-RPC. This wallet does not use lightwalletd.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use oss_core::{ErrorCode, NotReadyData, SpentData};
 use reqwest::{Client, Url};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
-use crate::control::Control;
+use crate::{chain::Block, control::Control};
 
 #[derive(Debug)]
 pub(crate) struct RpcError {
@@ -16,7 +20,7 @@ pub(crate) struct RpcError {
 }
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: Zakura RPC {}", self.method, self.error)
+        write!(f, "{}: RPC error {}", self.method, self.error)
     }
 }
 impl std::error::Error for RpcError {}
@@ -25,6 +29,8 @@ pub struct Rpc {
     client: Client,
     url: Url,
     cookie: Option<PathBuf>,
+    max_body: usize,
+    timeout: Duration,
     runtime: Option<tokio::runtime::Runtime>,
     pub(crate) control: Control,
 }
@@ -41,6 +47,16 @@ impl Drop for Rpc {
 
 impl Rpc {
     pub fn new(url: &str, cookie: Option<PathBuf>, control: &Control) -> Result<Self> {
+        Self::with_limits(url, cookie, control, 16 << 20, Duration::from_secs(30))
+    }
+
+    fn with_limits(
+        url: &str,
+        cookie: Option<PathBuf>,
+        control: &Control,
+        max_body: usize,
+        timeout: Duration,
+    ) -> Result<Self> {
         control.check()?;
         let url = Url::parse(url)?;
         ensure!(
@@ -52,11 +68,13 @@ impl Rpc {
         Ok(Self {
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(30))
+                .timeout(timeout)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             url,
             cookie,
+            max_body,
+            timeout,
             // The wallet/proof code stays synchronous on its blocking worker,
             // but HTTP waits are futures that can actually be cancelled.
             runtime: Some(
@@ -106,13 +124,13 @@ impl Rpc {
                 }
                 result = async {
                     let mut response = request.send().await.map_err(reqwest::Error::without_url)
-                        .with_context(|| format!("{method}: transport failed (10s connection / 30s request timeout)"))?;
+                        .with_context(|| format!("{method}: transport failed (10s connection / {}s request timeout)", self.timeout.as_secs()))?;
                     let status = response.status();
                     let mut bytes = Vec::new();
                     while let Some(chunk) = response.chunk().await.map_err(reqwest::Error::without_url)
                         .with_context(|| format!("{method}: reading response failed"))? {
-                        ensure!(chunk.len() <= (16 * 1024 * 1024usize).saturating_sub(bytes.len()),
-                            "{method}: RPC response exceeds 16 MiB");
+                        ensure!(chunk.len() <= self.max_body.saturating_sub(bytes.len()),
+                            "{method}: RPC response exceeds {} MiB", self.max_body >> 20);
                         bytes.extend_from_slice(&chunk);
                     }
                     Ok::<_, anyhow::Error>((status, bytes))
@@ -146,11 +164,39 @@ impl Rpc {
     pub fn height(&self) -> Result<u32> {
         self.call("getblockcount", json!([]))
     }
-    pub fn block(&self, height: u32) -> Result<crate::chain::Block> {
-        let mut block: crate::chain::Block =
-            self.call("gettachyonblock", json!([height.to_string()]))?;
+    /// Sleeps, unless the command is cancelled first.
+    fn sleep(&self, duration: Duration) -> Result<()> {
+        self.runtime
+            .as_ref()
+            .expect("runtime exists until the RPC client drops")
+            .block_on(async {
+                tokio::select! {
+                    _ = self.control.cancellation.cancelled() => {}
+                    _ = tokio::time::sleep(duration) => {}
+                }
+            });
+        self.control.check()
+    }
+
+    pub fn block(&self, height: u32) -> Result<Block> {
+        let block: Block = self.call("gettachyonblock", json!([height.to_string()]))?;
         ensure!(block.height == height, "gettachyonblock height mismatch");
-        let ordinary: Value = self.call("getblock", json!([block.hash, 1]))?;
+        self.with_transactions(block, false)
+    }
+
+    /// Fills in the block's transaction list from `getblock`. Zakura has none
+    /// for a pruned body, so an `archived` (OSS) block then keeps only the
+    /// txids of its stamps.
+    // shortcut: transparent-only transactions in pruned blocks never show as
+    // mined; have `oss_block` carry every txid if that starts to matter.
+    pub fn with_transactions(&self, mut block: Block, archived: bool) -> Result<Block> {
+        let ordinary: Value = match self.call("getblock", json!([block.hash, 1])) {
+            Err(error) if archived && error.is::<RpcError>() => {
+                block.transactions = block.stamps.iter().map(|s| s.txid.clone()).collect();
+                return Ok(block);
+            }
+            result => result?,
+        };
         ensure!(ordinary["hash"] == block.hash, "getblock identity mismatch");
         block.transactions = serde_json::from_value(ordinary["tx"].clone())?;
         for stamp in &block.stamps {
@@ -171,6 +217,79 @@ impl Rpc {
             "node returned a different transaction ID; input remains reserved"
         );
         Ok(())
+    }
+}
+
+/// The OSS client (design §4.1): an [`Rpc`] with a 64 MiB body cap, which
+/// waits out `NotReady` and turns the other OSS errors into clear ones.
+pub struct Oss {
+    rpc: Rpc,
+    /// How long one call waits out `NotReady` in all. Sealing a full epoch
+    /// holds the OSS for about 16 s.
+    pub(crate) patience: Duration,
+}
+
+impl Oss {
+    pub fn new(url: &str, cookie: Option<PathBuf>, control: &Control) -> Result<Self> {
+        Ok(Self {
+            // An `oss_unspent` call is up to 64 proof steps, maybe queued.
+            rpc: Rpc::with_limits(url, cookie, control, 64 << 20, Duration::from_secs(300))?,
+            patience: Duration::from_secs(90),
+        })
+    }
+
+    pub fn call<T: DeserializeOwned>(&self, method: &str, params: impl Serialize) -> Result<T> {
+        let params = serde_json::to_value(params)?;
+        let deadline = Instant::now() + self.patience;
+        loop {
+            let error = match self.rpc.call(method, params.clone()) {
+                Ok(result) => return Ok(result),
+                Err(error) => error,
+            };
+            let Some(RpcError {
+                code: Some(code),
+                error: body,
+                ..
+            }) = error.downcast_ref::<RpcError>()
+            else {
+                return Err(error);
+            };
+            let data = body["data"].clone();
+            match ErrorCode::from_code(*code) {
+                Some(ErrorCode::NotReady) => {
+                    let NotReadyData {
+                        retry_after_ms,
+                        reason,
+                    } = serde_json::from_value(data)?;
+                    let wait = Duration::from_millis(retry_after_ms.clamp(100, 10_000));
+                    ensure!(
+                        Instant::now() + wait <= deadline,
+                        "OSS not ready after {}s ({method}: {reason}); retry later",
+                        self.patience.as_secs()
+                    );
+                    self.rpc.sleep(wait)?;
+                }
+                Some(ErrorCode::Spent) => {
+                    let SpentData {
+                        epoch,
+                        height,
+                        txid,
+                    } = serde_json::from_value(data)?;
+                    bail!(
+                        "note is spent: the OSS has one of its nullifiers in epoch {epoch}, block {height}, transaction {txid}"
+                    );
+                }
+                Some(ErrorCode::Unavailable) => {
+                    return Err(error.context(
+                        "the OSS cannot serve this: it is outside its archive or no longer canonical",
+                    ));
+                }
+                Some(ErrorCode::InvalidParams) => {
+                    return Err(error.context("the OSS rejected the request"));
+                }
+                None => return Err(error.context("OSS request failed")),
+            }
+        }
     }
 }
 
