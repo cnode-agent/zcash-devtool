@@ -29,6 +29,9 @@ fn fetch_block(rpc: &Rpc, height: u32) -> Result<Block> {
     ))
 }
 
+/// Blocks fetched per batch of round trips while syncing.
+const FETCH_BATCH: u32 = 16;
+
 #[derive(Default)]
 pub(crate) struct SyncCache {
     blocks: std::collections::BTreeMap<u32, Block>,
@@ -38,8 +41,38 @@ pub(crate) struct SyncCache {
 }
 
 impl SyncCache {
-    fn fetch(&mut self, rpc: &Rpc, height: u32) -> Result<Block> {
-        let hash = rpc.hash(height)?;
+    /// Fetch several blocks in one batch of round trips and return the hash
+    /// this node reported for each. The hashes belong to the calling sync
+    /// alone: the cache is shared between wallets, whose nodes may disagree.
+    fn prefetch(
+        &mut self,
+        rpc: &Rpc,
+        heights: &[u32],
+    ) -> Result<std::collections::BTreeMap<u32, String>> {
+        let mut hashes = std::collections::BTreeMap::new();
+        if heights.len() < 2 {
+            return Ok(hashes);
+        }
+        for (height, (hash, block)) in heights.iter().zip(rpc.blocks(heights)?) {
+            if self
+                .blocks
+                .get(height)
+                .is_none_or(|cached| cached.hash != hash)
+            {
+                self.blocks.insert(*height, block);
+                self.fetches += 1;
+            }
+            hashes.insert(*height, hash);
+        }
+        Ok(hashes)
+    }
+
+    /// `known` is the hash this sync's node already reported for `height`.
+    fn fetch(&mut self, rpc: &Rpc, height: u32, known: Option<String>) -> Result<Block> {
+        let hash = match known {
+            Some(hash) => hash,
+            None => rpc.hash(height)?,
+        };
         if let Some(block) = self.blocks.get(&height)
             && block.hash == hash
         {
@@ -294,7 +327,24 @@ pub(crate) fn sync_with_cache(
         "Syncing heights {}–{stop} (node tip {tip})…",
         start.saturating_add(1).min(stop)
     ))?;
-    for height in start.saturating_add(1)..=stop {
+    let first_height = start.saturating_add(1);
+    let mut known = std::collections::BTreeMap::new();
+    for height in first_height..=stop {
+        if (height - first_height).is_multiple_of(FETCH_BATCH) {
+            let mut missing = Vec::new();
+            for height in height..=height.saturating_add(FETCH_BATCH - 1).min(stop) {
+                if store.block(height)?.is_none() {
+                    missing.push(height);
+                }
+            }
+            // Fetching ahead only saves round trips. If the batch fails, for
+            // example on a pruned height or an oversized reply, the loop below
+            // asks for each block on its own and reports that error.
+            match cache.lock().unwrap().prefetch(&rpc, &missing) {
+                Ok(hashes) => known = hashes,
+                Err(_) => control.check()?,
+            }
+        }
         control.stage(progress(height, start.saturating_add(1), stop, tip))?;
         let block = if let Some(cached) = store.block(height)? {
             if rpc.hash(height)? == cached.hash {
@@ -302,10 +352,11 @@ pub(crate) fn sync_with_cache(
             } else {
                 store.rewind(height - 1)?;
                 reorg = true;
-                cache.lock().unwrap().fetch(&rpc, height)?
+                cache.lock().unwrap().fetch(&rpc, height, None)?
             }
         } else {
-            cache.lock().unwrap().fetch(&rpc, height)?
+            let known = known.remove(&height);
+            cache.lock().unwrap().fetch(&rpc, height, known)?
         };
         control.stage(format!("Validating block {height}…"))?;
         cache

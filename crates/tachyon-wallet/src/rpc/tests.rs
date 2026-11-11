@@ -75,3 +75,34 @@ fn request_deadline_covers_stalled_body_without_a_signal() -> Result<()> {
     worker.join().unwrap();
     Ok(())
 }
+
+#[test]
+fn batch_results_follow_request_order_whatever_the_reply_order() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let (done, result) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let rpc = Rpc::new(&url, None, &Control::new(true)).unwrap();
+        done.send(rpc.batch::<String>("getblockhash", vec![json!([1]), json!([2])]))
+            .unwrap();
+    });
+    let mut connection = accept(&listener);
+    connection.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = [0; 2048];
+    assert!(connection.read(&mut request)? > 0);
+    let body =
+        r#"[{"id":1,"result":"second","error":null},{"id":0,"result":"first","error":null}]"#;
+    connection.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )?;
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5))??,
+        ["first", "second"]
+    );
+    worker.join().unwrap();
+    Ok(())
+}

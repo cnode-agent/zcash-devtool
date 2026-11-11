@@ -99,132 +99,154 @@ impl Node {
                 assert!(length < 16 * 1024 * 1024);
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
-                let request: Value = serde_json::from_slice(&body).unwrap();
-                let mut data = thread_data.lock().unwrap();
-                let params = &request["params"];
-                data.requests
-                    .push((request["method"].as_str().unwrap().into(), params.clone()));
-                let mut error = Value::Null;
-                let result = match request["method"].as_str().unwrap() {
-                    "getblockchaininfo" => json!({"chain":"test"}),
-                    "getblockcount" => json!(data.blocks.last().unwrap().height),
-                    "getaddressutxos" => {
-                        assert_eq!(params[0]["chainInfo"], true);
-                        if data.fail_funding_sync {
-                            error = json!({"code": -1, "message": "simulated UTXO index error"});
-                        }
-                        let tip = data.blocks.last().unwrap();
-                        json!({"height": tip.height, "hash": data.funding_hash_override.as_ref().unwrap_or(&tip.hash),
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let batch = body.is_array();
+                let requests = match body {
+                    Value::Array(requests) => requests,
+                    request => vec![request],
+                };
+                let mut replies = Vec::new();
+                for request in requests {
+                    let mut data = thread_data.lock().unwrap();
+                    let params = &request["params"];
+                    data.requests
+                        .push((request["method"].as_str().unwrap().into(), params.clone()));
+                    let mut error = Value::Null;
+                    let result = match request["method"].as_str().unwrap() {
+                        "getblockchaininfo" => json!({"chain":"test"}),
+                        "getblockcount" => json!(data.blocks.last().unwrap().height),
+                        "getaddressutxos" => {
+                            assert_eq!(params[0]["chainInfo"], true);
+                            if data.fail_funding_sync {
+                                error =
+                                    json!({"code": -1, "message": "simulated UTXO index error"});
+                            }
+                            let tip = data.blocks.last().unwrap();
+                            json!({"height": tip.height, "hash": data.funding_hash_override.as_ref().unwrap_or(&tip.hash),
                             "utxos": data.funding_utxos.iter().filter(|output| output["address"] == params[0]["addresses"][0]).collect::<Vec<_>>()})
-                    }
-                    "getblockhash" => {
-                        let h = params[0].as_u64().unwrap();
-                        if h == 0 {
-                            json!(hex::encode([0; 32]))
-                        } else {
-                            json!(
-                                data.blocks
+                        }
+                        "getblockhash" => {
+                            let h = params[0].as_u64().unwrap();
+                            if h == 0 {
+                                json!(hex::encode([0; 32]))
+                            } else {
+                                json!(
+                                    data.blocks
+                                        .iter()
+                                        .find(|b| u64::from(b.height) == h)
+                                        .unwrap()
+                                        .hash
+                                )
+                            }
+                        }
+                        "gettachyonblock" => {
+                            let h: u32 = params[0].as_str().unwrap().parse().unwrap();
+                            if data.pruned_heights.contains(&h) {
+                                error = json!({"code":-1,"message":"tachygram payload pruned"});
+                                Value::Null
+                            } else {
+                                serde_json::to_value(
+                                    data.blocks.iter().find(|b| b.height == h).unwrap(),
+                                )
+                                .unwrap()
+                            }
+                        }
+                        "getblock" => {
+                            let id = params[0].as_str().unwrap();
+                            if let Some(block) = id
+                                .parse::<u32>()
+                                .ok()
+                                .and_then(|height| data.earlier_blocks.get(&height))
+                            {
+                                block.clone()
+                            } else {
+                                let block = data
+                                    .blocks
                                     .iter()
-                                    .find(|b| u64::from(b.height) == h)
-                                    .unwrap()
-                                    .hash
-                            )
+                                    .find(|b| {
+                                        b.hash == id || Some(b.height) == id.parse::<u32>().ok()
+                                    })
+                                    .unwrap();
+                                json!({"hash":block.hash,"height":block.height,"tx":block.transactions})
+                            }
                         }
-                    }
-                    "gettachyonblock" => {
-                        let h: u32 = params[0].as_str().unwrap().parse().unwrap();
-                        if data.pruned_heights.contains(&h) {
-                            error = json!({"code":-1,"message":"tachygram payload pruned"});
-                            Value::Null
-                        } else {
-                            serde_json::to_value(
-                                data.blocks.iter().find(|b| b.height == h).unwrap(),
-                            )
-                            .unwrap()
+                        "gettxout" => {
+                            assert_eq!(params[2], true);
+                            let key = (
+                                params[0].as_str().unwrap().to_owned(),
+                                u32::try_from(params[1].as_u64().unwrap()).unwrap(),
+                            );
+                            data.txout_overrides
+                                .get(&key)
+                                .cloned()
+                                .unwrap_or_else(|| json!({"confirmations":100,"coinbase":false}))
                         }
-                    }
-                    "getblock" => {
-                        let id = params[0].as_str().unwrap();
-                        if let Some(block) = id
-                            .parse::<u32>()
-                            .ok()
-                            .and_then(|height| data.earlier_blocks.get(&height))
-                        {
-                            block.clone()
-                        } else {
-                            let block = data
+                        "getrawtransaction" if params[1] == 1 => {
+                            let txid = params[0].as_str().unwrap();
+                            if let Some(block) = data
                                 .blocks
                                 .iter()
-                                .find(|b| b.hash == id || Some(b.height) == id.parse::<u32>().ok())
-                                .unwrap();
-                            json!({"hash":block.hash,"height":block.height,"tx":block.transactions})
-                        }
-                    }
-                    "gettxout" => {
-                        assert_eq!(params[2], true);
-                        let key = (
-                            params[0].as_str().unwrap().to_owned(),
-                            u32::try_from(params[1].as_u64().unwrap()).unwrap(),
-                        );
-                        data.txout_overrides
-                            .get(&key)
-                            .cloned()
-                            .unwrap_or_else(|| json!({"confirmations":100,"coinbase":false}))
-                    }
-                    "getrawtransaction" if params[1] == 1 => {
-                        let txid = params[0].as_str().unwrap();
-                        if let Some(block) = data
-                            .blocks
-                            .iter()
-                            .find(|block| block.transactions.iter().any(|id| id == txid))
-                        {
-                            json!({"txid":txid,"blockhash":block.hash})
-                        } else if data.mempool.iter().any(|raw| {
-                            Transaction::read(&hex::decode(raw).unwrap()[..], BranchId::NuTachyon)
+                                .find(|block| block.transactions.iter().any(|id| id == txid))
+                            {
+                                json!({"txid":txid,"blockhash":block.hash})
+                            } else if data.mempool.iter().any(|raw| {
+                                Transaction::read(
+                                    &hex::decode(raw).unwrap()[..],
+                                    BranchId::NuTachyon,
+                                )
                                 .unwrap()
                                 .txid()
                                 .to_string()
-                                == txid
-                        }) {
-                            json!({"txid":txid})
-                        } else {
-                            error = json!({"code":-5,"message":"Transaction not found in mempool or best chain"});
-                            Value::Null
+                                    == txid
+                            }) {
+                                json!({"txid":txid})
+                            } else {
+                                error = json!({"code":-5,"message":"Transaction not found in mempool or best chain"});
+                                Value::Null
+                            }
                         }
+                        "getrawtransaction" => json!(
+                            data.raw_transactions
+                                .get(params[0].as_str().unwrap())
+                                .unwrap_or(&data.raw_funding)
+                        ),
+                        "sendrawtransaction" => {
+                            data.submissions += 1;
+                            let raw = params[0].as_str().unwrap().to_owned();
+                            let tx = Transaction::read(
+                                &hex::decode(&raw).unwrap()[..],
+                                BranchId::NuTachyon,
+                            )
+                            .unwrap();
+                            if !data.mempool.contains(&raw) {
+                                data.mempool.push(raw);
+                            }
+                            if data.fail_submission {
+                                error =
+                                    json!({"code":-1,"message":"simulated ambiguous broadcast"});
+                            }
+                            json!(tx.txid().to_string())
+                        }
+                        other => panic!("unexpected RPC {other}"),
+                    };
+                    if let Some((method, params, control)) = &data.cancel_request
+                        && request["method"] == *method
+                        && params
+                            .as_ref()
+                            .is_none_or(|params| request["params"] == *params)
+                    {
+                        control.cancellation.cancel();
                     }
-                    "getrawtransaction" => json!(
-                        data.raw_transactions
-                            .get(params[0].as_str().unwrap())
-                            .unwrap_or(&data.raw_funding)
-                    ),
-                    "sendrawtransaction" => {
-                        data.submissions += 1;
-                        let raw = params[0].as_str().unwrap().to_owned();
-                        let tx =
-                            Transaction::read(&hex::decode(&raw).unwrap()[..], BranchId::NuTachyon)
-                                .unwrap();
-                        if !data.mempool.contains(&raw) {
-                            data.mempool.push(raw);
-                        }
-                        if data.fail_submission {
-                            error = json!({"code":-1,"message":"simulated ambiguous broadcast"});
-                        }
-                        json!(tx.txid().to_string())
-                    }
-                    other => panic!("unexpected RPC {other}"),
-                };
-                if let Some((method, params, control)) = &data.cancel_request
-                    && request["method"] == *method
-                    && params
-                        .as_ref()
-                        .is_none_or(|params| request["params"] == *params)
-                {
-                    control.cancellation.cancel();
+                    drop(data);
+                    replies.push(
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result,"error":error}),
+                    );
                 }
-                drop(data);
-                let response = serde_json::to_vec(
-                    &json!({"jsonrpc":"2.0","id":1,"result":result,"error":error}),
-                )
+                let response = if batch {
+                    serde_json::to_vec(&replies)
+                } else {
+                    serde_json::to_vec(&replies[0])
+                }
                 .unwrap();
                 let mut stream = reader.into_inner();
                 // Cancellation can drop the HTTP connection before the reply.
