@@ -142,3 +142,8 @@ resolver = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Proof steps live in dependencies; unoptimized they make debug tests many
+# times slower. Our own crates stay debuggable.
+[profile.dev.package."*"]
+opt-level = 3
