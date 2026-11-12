@@ -3,6 +3,6 @@
 
 pub use oss_core::{
     TachyonBlock as Block, anchor, anchor_hex, bytes32,
-    chain::{validate, validate_checkpoint},
+    chain::{validate, validate_checkpoint, validate_thin},
     max_polynomial_members,
 };

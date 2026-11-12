@@ -95,17 +95,23 @@ impl ChainData<'_> {
     /// All blocks in `epoch`, plus the first block of the next epoch when the
     /// epoch has closed. Only this range is read, never the whole chain.
     pub fn epoch_blocks(&self, epoch: u32) -> Result<Vec<Block>> {
-        match self {
-            Self::Blocks(blocks) => Ok(blocks
+        let blocks = match self {
+            Self::Blocks(blocks) => blocks
                 .iter()
                 .filter(|block| block.epoch == epoch || block.epoch == epoch + 1)
                 .cloned()
-                .collect()),
+                .collect(),
             Self::Store(store) => {
                 let start = self.epoch_start(epoch)?;
-                store.blocks_range(start, start.saturating_add(EPOCH_SIZE))
+                store.blocks_range(start, start.saturating_add(EPOCH_SIZE))?
             }
-        }
+        };
+        // Proving needs every tachygram; a thin copy would prove the wrong sets.
+        ensure!(
+            !blocks.iter().any(|b| b.epoch == epoch && b.is_thin()),
+            "epoch {epoch} was synced thin, without its tachygrams: only the OSS can prove it"
+        );
+        Ok(blocks)
     }
 
     fn epoch_start(&self, epoch: u32) -> Result<u32> {
@@ -469,6 +475,18 @@ impl Store {
         }
         Ok(())
     }
+    /// Whether some block of `epoch` was synced thin, so the tachygram index
+    /// misses its spends.
+    pub fn thin_epoch(&self, epoch: u32) -> Result<bool> {
+        if !self.table_exists("thin_blocks")? {
+            return Ok(false);
+        }
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thin_blocks WHERE epoch=?)",
+            [epoch],
+            |row| row.get(0),
+        )?)
+    }
     pub fn tachygram_height(&self, id: &str) -> Result<Option<u32>> {
         self.ensure_indexes()?;
         Ok(self
@@ -598,6 +616,9 @@ impl Store {
         }
         self.conn.execute("DELETE FROM epoch_proofs", [])?;
         self.conn.execute("DELETE FROM spendable_proofs", [])?;
+        if self.table_exists("thin_blocks")? {
+            self.conn.execute("DELETE FROM thin_blocks", [])?;
+        }
         if self.table_exists("note_nullifiers")? {
             self.conn
                 .execute("UPDATE note_nullifiers SET spent_height=NULL", [])?;
@@ -875,11 +896,35 @@ impl Store {
             params![block.height, serde_json::to_string(block)?],
         )?;
         self.index_block(block)?;
+        if block.is_thin() {
+            // Created on first use, so read-only commands work on older wallets.
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS thin_blocks (height INTEGER PRIMARY KEY, epoch INTEGER NOT NULL);
+                 CREATE INDEX IF NOT EXISTS thin_blocks_by_epoch ON thin_blocks(epoch);",
+            )?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO thin_blocks VALUES(?, ?)",
+                params![block.height, block.epoch],
+            )?;
+            // A spend in this block is invisible here: drop the epoch's
+            // unspent rows, to check them again through the OSS.
+            self.conn.execute(
+                "DELETE FROM note_nullifiers WHERE epoch=? AND spent_height IS NULL",
+                [block.epoch],
+            )?;
+        } else if self.table_exists("thin_blocks")? {
+            self.conn
+                .execute("DELETE FROM thin_blocks WHERE height=?", [block.height])?;
+        }
         Ok(())
     }
     pub fn rewind(&self, height: u32) -> Result<()> {
         self.conn
             .execute("DELETE FROM blocks WHERE height > ?", [height])?;
+        if self.table_exists("thin_blocks")? {
+            self.conn
+                .execute("DELETE FROM thin_blocks WHERE height > ?", [height])?;
+        }
         if self.table_exists("tachygrams")? {
             self.conn
                 .execute("DELETE FROM tachygrams WHERE height > ?", [height])?;

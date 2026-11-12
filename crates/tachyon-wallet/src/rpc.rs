@@ -1,7 +1,10 @@
 //! Direct, bounded Zakura JSON-RPC. This wallet does not use lightwalletd.
 
 use anyhow::{Context, Result, bail, ensure};
-use oss_core::{BlockParams, ErrorCode, InfoParams, InfoResult, NotReadyData, SpentData};
+use oss_core::{
+    BlockParams, ErrorCode, InfoParams, InfoResult, MAX_TACHYGRAM_VALUES, NotReadyData, SpentData,
+    TachygramsParams, TachygramsResult,
+};
 use reqwest::{Client, Url};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -233,6 +236,8 @@ pub struct Oss {
     /// How long one call waits out `NotReady` in all. Sealing a full epoch
     /// holds the OSS for about 16 s.
     pub(crate) patience: Duration,
+    /// Log every request and how long it took (`-v`).
+    pub(crate) verbose: bool,
 }
 
 impl Oss {
@@ -241,6 +246,7 @@ impl Oss {
             // An `oss_unspent` call is up to 64 proof steps, maybe queued.
             rpc: Rpc::with_limits(url, cookie, control, 64 << 20, Duration::from_secs(300))?,
             patience: Duration::from_secs(90),
+            verbose: false,
         })
     }
 
@@ -248,7 +254,7 @@ impl Oss {
         let params = serde_json::to_value(params)?;
         let deadline = Instant::now() + self.patience;
         loop {
-            let error = match self.rpc.call(method, params.clone()) {
+            let error = match self.timed(method, params.clone()) {
                 Ok(result) => return Ok(result),
                 Err(error) => error,
             };
@@ -298,6 +304,20 @@ impl Oss {
         }
     }
 
+    /// One request, logged with its duration when verbose.
+    fn timed<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        let log = |line: String| self.verbose.then(|| self.rpc.control.notice(&line));
+        log(format!("contacting OSS ({method})…"));
+        let started = Instant::now();
+        let result = self.rpc.call(method, params);
+        let secs = started.elapsed().as_secs_f64();
+        log(match &result {
+            Ok(_) => format!("got OSS response ({method}, {secs:.1}s)"),
+            Err(_) => format!("OSS request failed ({method}, {secs:.1}s)"),
+        });
+        result
+    }
+
     /// Waits up to 10 s for the OSS tip to reach the node's (design §4.3).
     /// Returns the first height of its archive and its tip.
     pub fn archive(&self, node_tip: u32, genesis: &str) -> Result<(u32, u32)> {
@@ -317,10 +337,33 @@ impl Oss {
     }
 
     /// The archived `gettachyonblock` JSON, kept after the node prunes it.
-    pub fn block(&self, height: u32) -> Result<Block> {
-        let block: Block = self.call("oss_block", BlockParams { height })?;
+    /// `thin` leaves out the tachygrams (thin sync).
+    pub fn block(&self, height: u32, thin: bool) -> Result<Block> {
+        let block: Block = self.call("oss_block", BlockParams { height, thin })?;
         ensure!(block.height == height, "oss_block height mismatch");
         Ok(block)
+    }
+
+    /// Where each value is published in the OSS archive, if anywhere.
+    // privacy: the OSS learns every value asked (see the callers' warnings).
+    pub fn tachygrams(&self, values: &[String]) -> Result<Vec<Option<u32>>> {
+        let mut heights = Vec::with_capacity(values.len());
+        for chunk in values.chunks(MAX_TACHYGRAM_VALUES) {
+            let TachygramsResult { heights: answer } = self.call(
+                "oss_tachygrams",
+                TachygramsParams {
+                    values: chunk.to_vec(),
+                },
+            )?;
+            ensure!(
+                answer.len() == chunk.len(),
+                "the OSS answered {} of {} tachygram lookups",
+                answer.len(),
+                chunk.len()
+            );
+            heights.extend(answer);
+        }
+        Ok(heights)
     }
 }
 

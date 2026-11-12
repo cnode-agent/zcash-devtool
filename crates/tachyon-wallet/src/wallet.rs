@@ -49,6 +49,9 @@ pub struct Command {
     /// Cookie file for the OSS's HTTP Basic auth.
     #[arg(long, global = true, env = "TACHYON_OSS_COOKIE")]
     oss_cookie_file: Option<PathBuf>,
+    /// Log each OSS request and its response time on stderr.
+    #[arg(long, short = 'v', global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Operation,
 }
@@ -285,7 +288,11 @@ impl Command {
         let key = SpendingKey::from(config.seed);
         let oss = self
             .oss_url
-            .map(|url| Oss::new(&url, self.oss_cookie_file, control))
+            .map(|url| {
+                let mut oss = Oss::new(&url, self.oss_cookie_file, control)?;
+                oss.verbose = self.verbose;
+                anyhow::Ok(oss)
+            })
             .transpose()?;
         let oss = oss.as_ref();
         let result = match self.command {
@@ -623,10 +630,17 @@ fn find_pending(store: &Store, txid: &str) -> Result<Pending> {
         .with_context(|| format!("unknown wallet transaction {txid}"))
 }
 
+/// Where nullifiers are published, for epochs synced thin (see `sync`).
+pub(crate) type ThinLookup<'a> = &'a dyn Fn(&[String]) -> Result<Vec<Option<u32>>>;
+
+/// Records each note's nullifier per epoch, and where it is spent. Epochs
+/// synced thin are asked about through `thin`, once complete; without it,
+/// they wait for the next sync.
 pub(crate) fn refresh_note_nullifiers(
     store: &Store,
     config: &Config,
     current_epoch: u32,
+    thin: Option<ThinLookup<'_>>,
 ) -> Result<()> {
     let key = SpendingKey::from(config.seed);
     for receipt in store.notes_without_nullifier(current_epoch)? {
@@ -639,6 +653,8 @@ pub(crate) fn refresh_note_nullifiers(
         let master = key.derive_nullifier_private().derive_note_private(note.psi);
         let existing = store.note_nullifier_epochs(&id)?;
         let first_epoch = (creation - config.activation) / EPOCH_SIZE;
+        // (epoch, nullifier, spent height, ask the OSS)
+        let mut rows = Vec::new();
         for epoch in first_epoch..=current_epoch {
             if existing.contains(&epoch) {
                 continue;
@@ -646,6 +662,25 @@ pub(crate) fn refresh_note_nullifiers(
             let nullifier =
                 hex::encode(Fp::from(master.derive_nullifier(EpochIndex::new(epoch))).to_bytes());
             let spent_height = store.tachygram_height(&nullifier)?;
+            let ask = spent_height.is_none() && store.thin_epoch(epoch)?;
+            // A thin epoch still syncing would be asked about again later.
+            if ask && (epoch == current_epoch || thin.is_none()) {
+                break;
+            }
+            rows.push((epoch, nullifier, spent_height, ask));
+            if spent_height.is_some() {
+                break;
+            }
+        }
+        // One request per note, like `oss_unspent`.
+        let asked: Vec<String> = rows.iter().filter(|r| r.3).map(|r| r.1.clone()).collect();
+        let mut answers = match thin {
+            Some(lookup) if !asked.is_empty() => lookup(&asked)?,
+            _ => Vec::new(),
+        }
+        .into_iter();
+        for (epoch, nullifier, local, ask) in rows {
+            let spent_height = if ask { answers.next().flatten() } else { local };
             store.put_note_nullifier(&id, epoch, &nullifier, spent_height)?;
             if spent_height.is_some() {
                 break;
@@ -672,7 +707,8 @@ fn reserved_note_ids(store: &Store) -> Result<BTreeSet<String>> {
 fn ensure_note_states(store: &Store, config: &Config, allow_refresh: bool) -> Result<()> {
     let current_epoch = store.tip()?.map(|block| block.epoch).unwrap_or(0);
     if allow_refresh {
-        refresh_note_nullifiers(store, config, current_epoch)
+        // Thin epochs were checked by the sync that stored them.
+        refresh_note_nullifiers(store, config, current_epoch, None)
     } else {
         ensure!(
             store

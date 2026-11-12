@@ -420,6 +420,7 @@ fn missing_history_and_cancelled_backfill_preserve_wallet_and_checkpoint() -> Re
             expected_tip: None,
             oss_url: None,
             oss_cookie_file: None,
+            verbose: false,
             command: operation()
         }
         .execute_with_control(&control)

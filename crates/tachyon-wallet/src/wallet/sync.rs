@@ -27,7 +27,7 @@ pub(super) fn checkpoint(
     rpc.control.stage(format!(
         "Loading trusted epoch checkpoint at height {height}…"
     ))?;
-    let block = fetch_block(rpc, archive, height)?;
+    let block = fetch_block(rpc, archive, height, false)?;
     chain::validate_checkpoint(&block, activation)?;
     ensure!(
         rpc.hash(height)? == block.hash,
@@ -36,10 +36,13 @@ pub(super) fn checkpoint(
     Ok(block)
 }
 
-fn fetch_block(rpc: &Rpc, archive: Archive, height: u32) -> Result<Block> {
+/// `thin` asks the OSS to leave out the tachygrams; the node always sends them.
+// privacy: the OSS sees which heights this wallet syncs, so where its history
+// starts and when it is online.
+fn fetch_block(rpc: &Rpc, archive: Archive, height: u32, thin: bool) -> Result<Block> {
     match archive {
         Some((oss, from)) if height >= from => oss
-            .block(height)
+            .block(height, thin)
             .and_then(|block| rpc.with_transactions(block, true)),
         _ => rpc.block(height),
     }
@@ -51,36 +54,49 @@ fn fetch_block(rpc: &Rpc, archive: Archive, height: u32) -> Result<Block> {
 #[derive(Default)]
 pub(crate) struct SyncCache {
     blocks: std::collections::BTreeMap<u32, Block>,
-    validated: std::collections::BTreeSet<(u32, String, String)>,
+    validated: std::collections::BTreeSet<(u32, String, String, bool)>,
     fetches: usize,
     validations: usize,
 }
 
 impl SyncCache {
-    fn fetch(&mut self, rpc: &Rpc, archive: Archive, height: u32) -> Result<Block> {
+    fn fetch(&mut self, rpc: &Rpc, archive: Archive, height: u32, thin: bool) -> Result<Block> {
         let hash = rpc.hash(height)?;
         if let Some(block) = self.blocks.get(&height)
             && block.hash == hash
+            && (thin || !block.is_thin())
         {
             return Ok(block.clone());
         }
-        let block = fetch_block(rpc, archive, height)?;
+        let block = fetch_block(rpc, archive, height, thin)?;
         ensure!(block.hash == hash, "Tachyon block changed during fetch");
         self.blocks.insert(height, block.clone());
         self.fetches += 1;
         Ok(block)
     }
 
-    fn validate(&mut self, block: &Block, previous: Option<&Block>, activation: u32) -> Result<()> {
+    /// `thin`: the block may be a thin copy.
+    fn validate(
+        &mut self,
+        block: &Block,
+        previous: Option<&Block>,
+        activation: u32,
+        thin: bool,
+    ) -> Result<()> {
         let key = (
             block.height,
             block.hash.clone(),
             previous.map(|block| block.hash.clone()).unwrap_or_default(),
+            block.is_thin(),
         );
         if self.validated.contains(&key) {
             return Ok(());
         }
-        chain::validate(block, previous, activation)?;
+        if thin {
+            chain::validate_thin(block, previous, activation)?;
+        } else {
+            chain::validate(block, previous, activation)?;
+        }
         self.validated.insert(key);
         self.validations += 1;
         Ok(())
@@ -116,6 +132,7 @@ fn located_block(
     }
     // Check the cheap, retained block metadata first. A stale height hint must
     // not require the payload of an unrelated, potentially pruned block.
+    // privacy: tells the node which block paid this wallet.
     let hash = rpc.hash(height)?;
     let header: Value = rpc.call("getblock", json!([hash, 1]))?;
     ensure!(
@@ -131,7 +148,7 @@ fn located_block(
     {
         return Ok(None);
     }
-    let block = fetch_block(rpc, None, height)?;
+    let block = fetch_block(rpc, None, height, false)?;
     // The subsequent contiguous sync validates the transitions from our
     // checkpoint. This lookup alone never makes a note spendable.
     ensure!(
@@ -157,6 +174,7 @@ pub(super) fn locate(
     }
     // A reorg can move the same transaction to another height. Ignore the
     // stale hint and resolve the txid against the node's current chain.
+    // privacy: tells the node which transaction paid this wallet.
     let result: Value = match rpc.call("getrawtransaction", json!([locator.txid, 1])) {
         Ok(result) => result,
         Err(error) if error.downcast_ref::<RpcError>().is_some_and(|error| error.code == Some(-5)) => return Ok(None),
@@ -289,6 +307,8 @@ pub(crate) fn sync_with_cache(
         ensure!(height <= tip, "search height is above the node tip");
         needed_start = needed_start.min(epoch_start(height, config.activation)?);
     }
+    // Full blocks that hold receipts, from the node.
+    let mut located = std::collections::BTreeMap::new();
     for mut receipt in store.unresolved_notes()? {
         control.check()?;
         receipt.check_owner(&SpendingKey::from(config.seed), &config.network_id)?;
@@ -299,8 +319,16 @@ pub(crate) fn sync_with_cache(
                 .as_mut()
                 .expect("located receipts have a locator");
             locator.height = Some(block.height);
-            locator.block_hash = Some(block.hash);
+            locator.block_hash = Some(block.hash.clone());
             store.put_note(&receipt)?;
+            // A receipt can arrive after its block was synced thin.
+            if store
+                .block(block.height)?
+                .is_some_and(|stored| stored.is_thin())
+            {
+                fill(store, &block, config.activation)?;
+            }
+            located.insert(block.height, block);
         }
     }
     let backfill = needed_start < first;
@@ -316,6 +344,15 @@ pub(crate) fn sync_with_cache(
     };
     let start = previous.as_ref().expect("sync has a checkpoint").height;
     let stop = start.saturating_add(max_blocks).min(synced_tip);
+    // Thin sync: closed epochs come from the OSS without their tachygrams.
+    // Receipts' blocks stay full, and spends in thin epochs are looked up at
+    // the end. A rescan (`--from-height`) fetches full blocks.
+    let current_epoch = synced_tip.saturating_sub(config.activation) / EPOCH_SIZE;
+    let thin = |height: u32| {
+        archive.is_some_and(|(_, from)| height >= from)
+            && (height - config.activation) / EPOCH_SIZE < current_epoch
+    };
+    let fetch_thin = |height| from_height.is_none() && thin(height);
     control.stage(format!(
         "Syncing heights {}–{stop} (node tip {tip})…",
         start.saturating_add(1).min(stop)
@@ -328,16 +365,30 @@ pub(crate) fn sync_with_cache(
             } else {
                 store.rewind(height - 1)?;
                 reorg = true;
-                cache.lock().unwrap().fetch(&rpc, archive, height)?
+                cache
+                    .lock()
+                    .unwrap()
+                    .fetch(&rpc, archive, height, fetch_thin(height))?
             }
         } else {
-            cache.lock().unwrap().fetch(&rpc, archive, height)?
+            cache
+                .lock()
+                .unwrap()
+                .fetch(&rpc, archive, height, fetch_thin(height))?
+        };
+        // Keep a receipt's block in full. Its thin copy was fetched anyway: a
+        // gap in the requests would point the OSS at the note.
+        let block = match located.remove(&height) {
+            Some(full) if full.hash == block.hash => full,
+            _ => block,
         };
         control.stage(format!("Validating block {height}…"))?;
-        cache
-            .lock()
-            .unwrap()
-            .validate(&block, previous.as_ref(), config.activation)?;
+        cache.lock().unwrap().validate(
+            &block,
+            previous.as_ref(),
+            config.activation,
+            thin(height),
+        )?;
         control.check()?;
         store.put_block(&block)?;
         previous = Some(block);
@@ -351,7 +402,8 @@ pub(crate) fn sync_with_cache(
         rpc.hash(last.height)? == last.hash,
         "chain reorganized during sync; retry"
     );
-    super::refresh_note_nullifiers(store, config, last.epoch)?;
+    let lookup = |values: &[String]| thin_spends(store, &rpc, archive, config.activation, values);
+    super::refresh_note_nullifiers(store, config, last.epoch, Some(&lookup))?;
     let unresolved = store.unresolved_notes()?.len();
     Ok(
         json!({"height":last.height,"hash":last.hash,"epoch":last.epoch,"caught_up":last.height == tip,
@@ -361,4 +413,54 @@ pub(crate) fn sync_with_cache(
         "unresolved_receipts":unresolved,
         "transparent_synced_height":store.funding_snapshot()?.map(|snapshot| snapshot.height)}),
     )
+}
+
+/// Where `nullifiers` are published, for epochs synced thin, from the OSS.
+/// Each claimed spend is checked in its block, which is then kept in full: a
+/// false claim would hide the note.
+fn thin_spends(
+    store: &Store,
+    rpc: &Rpc,
+    archive: Archive,
+    activation: u32,
+    nullifiers: &[String],
+) -> Result<Vec<Option<u32>>> {
+    let (oss, _) = archive
+        .context("this wallet synced epochs thin through an OSS; pass --oss-url to check them")?;
+    rpc.control.privacy(&format!(
+        "asked the OSS whether a note is spent, with its nullifiers for {} epoch(s) synced thin. \
+         The OSS can link them to each other, and a published one to the transaction that spent the note.",
+        nullifiers.len()
+    ));
+    let heights = oss.tachygrams(nullifiers)?;
+    for (nullifier, height) in nullifiers.iter().zip(&heights) {
+        if let Some(height) = *height {
+            let block = fetch_block(rpc, archive, height, false)?;
+            ensure!(
+                block
+                    .stamps
+                    .iter()
+                    .any(|s| s.tachygrams.contains(nullifier)),
+                "the OSS says block {height} publishes a nullifier that it does not"
+            );
+            fill(store, &block, activation)?;
+        }
+    }
+    Ok(heights)
+}
+
+/// Replaces the synced block at `full.height` with `full`, once it is the
+/// same block with every tachygram.
+fn fill(store: &Store, full: &Block, activation: u32) -> Result<()> {
+    let stored = store
+        .block(full.height)?
+        .with_context(|| format!("block {} is not synced", full.height))?;
+    ensure!(
+        stored.hash == full.hash && stored.anchor_after == full.anchor_after,
+        "block {} changed since it was synced; sync again",
+        full.height
+    );
+    let previous = store.block(full.height - 1)?;
+    chain::validate(full, previous.as_ref(), activation)?;
+    store.put_block(full)
 }

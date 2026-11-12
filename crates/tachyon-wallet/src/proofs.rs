@@ -121,8 +121,16 @@ fn remote_bucket(
         );
     };
     let r0 = QrDiscriminant(Fp::from_bytes(bytes32(&r0)?).context("invalid OSS discriminant")?);
-    let profiles: Vec<_> = profiles.iter().map(|p| p.profile).collect();
-    let profile = profile_of(value, r0, &profiles).context("no OSS bucket on the routing path")?;
+    let leaves: Vec<_> = profiles.iter().map(|p| p.profile).collect();
+    let profile = profile_of(value, r0, &leaves).context("no OSS bucket on the routing path")?;
+    let members = profiles
+        .iter()
+        .find(|p| p.profile == profile)
+        .map_or(0, |p| p.members);
+    control.privacy(&format!(
+        "asked the OSS for the epoch {epoch} bucket that holds a note commitment, \
+         which narrows the note to that bucket's {members} values"
+    ));
     let BucketResult { pcd } = oss.call("oss_bucket", BucketParams { epoch, profile })?;
     let bucket = pcd_from_hex::<qr::QrBucket>(&pcd)?;
     ensure!(
@@ -155,6 +163,11 @@ impl Prover<'_> {
                 "Requesting unspent evidence for {} epochs from {epoch_start}…",
                 nfs.len()
             ))?;
+            control.privacy(&format!(
+                "sent the OSS a note's nullifiers for {} epoch(s) from epoch {epoch_start}. \
+                 The OSS can link them to each other, and the first epoch dates the note.",
+                nfs.len()
+            ));
             let answer = oss.call::<UnspentResult>(
                 "oss_unspent",
                 UnspentParams {
@@ -264,6 +277,10 @@ impl Prover<'_> {
                 let entry = chain.epoch_sentinel(chain.tip()?.epoch)?;
                 if from.iter().all(|a| *a == entry) {
                     control.stage("Requesting anchor spans…")?;
+                    control.privacy(&format!(
+                        "asked the OSS for anchor spans: it learns that {} note(s) from closed epochs are about to be spent",
+                        from.len()
+                    ));
                     let from_hex = from.iter().map(|a| anchor_hex(*a)).collect();
                     let answer =
                         oss.call("oss_anchorspans", AnchorSpansParams { from: from_hex })?;

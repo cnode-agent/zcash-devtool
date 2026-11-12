@@ -563,7 +563,7 @@ fn checkpoint_history_spends(remote: bool) -> Result<()> {
 
 /// Add distinct public stamp inputs without generating thousands of payments.
 /// Each stamp fits individually; their union deliberately exceeds one polynomial.
-fn populate_epoch(blocks: &mut Vec<Block>, count: usize) -> Result<()> {
+pub(crate) fn populate_epoch(blocks: &mut Vec<Block>, count: usize) -> Result<()> {
     mine(blocks, None)?;
     let parent_index = blocks.len() - 2;
     let mut block = blocks.last().unwrap().clone();
@@ -710,7 +710,7 @@ fn note_spend_tracking_updates_from_new_blocks_and_rewinds() -> Result<()> {
     let available = store.confirmed_unspent_note_rows()?;
     assert_eq!(available.len(), 1);
     assert_eq!(available[0].0, receipt.id()?);
-    crate::wallet::refresh_note_nullifiers(&store, &config, 0)?;
+    crate::wallet::refresh_note_nullifiers(&store, &config, 0, None)?;
     assert!(store.confirmed_notes_without_nullifier(0)?.is_empty());
     assert!(store.spent_note_ids()?.is_empty());
 

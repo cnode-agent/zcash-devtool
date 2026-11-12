@@ -249,6 +249,16 @@ impl Control {
         ));
     }
 
+    /// A line on stderr that `--quiet` keeps, like errors.
+    pub(crate) fn notice(&self, message: &str) {
+        diagnostic(message);
+    }
+
+    /// Says on stderr what an OSS request reveals (design §4.4), until PIR hides it.
+    pub(crate) fn privacy(&self, what: &str) {
+        diagnostic(&format!("privacy warning: {what}"));
+    }
+
     fn write_progress(&self, message: &str) {
         if !self.quiet {
             diagnostic(message);

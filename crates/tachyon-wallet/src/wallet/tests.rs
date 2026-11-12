@@ -319,6 +319,7 @@ fn command_with_id(dir: &std::path::Path, command: Operation, id: Option<&str>) 
         quiet: true,
         oss_url: None,
         oss_cookie_file: None,
+        verbose: false,
         command,
     }
     .execute()
@@ -332,6 +333,7 @@ fn remote(dir: &std::path::Path, url: &str, command: Operation) -> Result<Value>
         quiet: true,
         oss_url: Some(url.into()),
         oss_cookie_file: None,
+        verbose: false,
         command,
     }
     .execute()
@@ -531,6 +533,7 @@ fn expected_tip_skips_redundant_sync_and_rejects_stale_tip() -> Result<()> {
         quiet: true,
         oss_url: None,
         oss_cookie_file: None,
+        verbose: false,
         command: Operation::Send {
             to: note::address(&SpendingKey::from([9; 32])),
             amount_zat: 50_000,
@@ -558,6 +561,7 @@ fn expected_tip_skips_redundant_sync_and_rejects_stale_tip() -> Result<()> {
         quiet: true,
         oss_url: None,
         oss_cookie_file: None,
+        verbose: false,
         command: Operation::Send {
             to: note::address(&SpendingKey::from([9; 32])),
             amount_zat: 50_000,
@@ -1474,6 +1478,7 @@ fn cancelled_sync_rolls_back_blocks_and_funding_snapshot_and_can_resume() -> Res
         quiet: true,
         oss_url: None,
         oss_cookie_file: None,
+        verbose: false,
         command: Operation::Sync {
             max_blocks: 1000,
             from_height: None,
@@ -1505,6 +1510,7 @@ fn cancelled_broadcast_retains_signed_payment_and_reservation() -> Result<()> {
         quiet: true,
         oss_url: None,
         oss_cookie_file: None,
+        verbose: false,
         command: transparent_send(&address, 100_000),
     }
     .execute_with_control(&control)
@@ -2067,5 +2073,112 @@ fn remote_sync_stops_at_an_oss_one_block_behind_the_node() -> Result<()> {
     let synced = remote(&dir, &url, SYNC)?;
     assert_eq!(synced["height"], tip, "{synced}");
     assert_eq!(synced["caught_up"], true);
+    Ok(())
+}
+
+/// Copies a wallet directory: the same seed and history, synced no further.
+fn copy_wallet(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir(to)?;
+    std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o700))?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        std::fs::copy(entry.path(), to.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+/// Across a closed epoch, thin sync finds a spend that a stale copy of the
+/// wallet never saw, and a receipt imported late stays spendable.
+#[test]
+fn thin_sync_finds_a_spend_made_elsewhere_and_a_late_receipt() -> Result<()> {
+    const ALL: Operation = Operation::Sync {
+        max_blocks: 10000,
+        from_height: None,
+    };
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let path = |name| temp.path().join(name);
+    let (alice, stale, bob) = (path("alice"), path("stale"), path("bob"));
+    let funding = init_wallet(&node, &alice)?;
+    install_funding(&node, &funding, &[1_000_000])?;
+    let shield = Operation::Shield {
+        amount_zat: Some(800_000),
+        txid: None,
+        index: None,
+    };
+    command(&alice, shield)?;
+    node.mine()?;
+    copy_wallet(&alice, &stale)?;
+    init_wallet(&node, &bob)?;
+    let address = |dir| -> Result<String> {
+        Ok(command(dir, Operation::Address)?["tachyon_address"]
+            .as_str()
+            .unwrap()
+            .into())
+    };
+    let to = address(&bob)?;
+    let sent = command(
+        &alice,
+        Operation::Send {
+            to,
+            amount_zat: 200_000,
+        },
+    )?;
+    node.mine()?;
+    let receipt = path("payment.json");
+    command(
+        &alice,
+        Operation::ExportReceipt {
+            txid: sent["txid"].as_str().unwrap().into(),
+            out: receipt.clone(),
+            legacy: false,
+        },
+    )?;
+    let tip = {
+        let mut data = node.data.lock().unwrap();
+        // Someone else's payment: a block that stays thin.
+        crate::tests::populate_epoch(&mut data.blocks, 3)?;
+        let block = data.blocks.last_mut().unwrap();
+        block.transactions = block.stamps.iter().map(|s| s.txid.clone()).collect();
+        while data.blocks.last().unwrap().epoch < 1 {
+            crate::tests::mine(&mut data.blocks, None)?;
+        }
+        data.blocks.last().unwrap().height
+    };
+    let db = oss::testing::TempDb::new();
+    let (url, oss) = oss::testing::spawn_oss(&node.url, &db.0)?;
+    oss.wait_ready(0)?;
+    oss.wait_built(tip)?;
+
+    // The stale copy learns of Alice's spend only from the OSS lookup.
+    assert_eq!(remote(&stale, &url, ALL)?["caught_up"], true);
+    assert_eq!(command(&stale, Operation::Balance)?["available_zat"], 0);
+    assert!(Store::open_readonly(&stale)?.thin_epoch(0)?);
+
+    // Bob's note is in the closed epoch: its block stays full, and it spends.
+    command(
+        &bob,
+        Operation::Receive {
+            receipt,
+            txid: None,
+            height: None,
+        },
+    )?;
+    assert_eq!(remote(&bob, &url, ALL)?["caught_up"], true);
+    assert_eq!(command(&bob, Operation::Balance)?["available_zat"], 200_000);
+    let to = address(&alice)?;
+    remote(
+        &bob,
+        &url,
+        Operation::Send {
+            to,
+            amount_zat: 100_000,
+        },
+    )?;
+    node.mine()?;
+    remote(&bob, &url, ALL)?;
+    let balance = command(&bob, Operation::Balance)?;
+    assert_eq!(balance["available_zat"], 100_000 - FEE, "{balance}");
     Ok(())
 }
