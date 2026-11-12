@@ -137,6 +137,38 @@ fn same_epoch_spend_proves_its_spans_without_the_oss() -> Result<()> {
 }
 
 #[test]
+fn a_proxy_html_error_reports_its_http_status() -> Result<()> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let proxy = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = Vec::new();
+        let mut chunk = [0; 4096];
+        while !request.ends_with(b"}") {
+            let n = stream.read(&mut chunk)?;
+            assert!(n > 0, "the client closed before sending its body");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let body = "<html>401 Authorization Required</html>";
+        write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    });
+    let error = Oss::new(&url, None, &Control::new(true))?
+        .call::<serde_json::Value>("oss_info", serde_json::json!({}))
+        .unwrap_err();
+    proxy.join().unwrap()?;
+    assert!(
+        format!("{error:#}").contains("oss_info: invalid RPC JSON (HTTP 401 Unauthorized)"),
+        "{error:#}"
+    );
+    Ok(())
+}
+
+#[test]
 fn remote_proves_epochs_below_the_oss_archive_locally() -> Result<()> {
     let mut blocks = vec![genesis()];
     let receipt = own(1_000_000);

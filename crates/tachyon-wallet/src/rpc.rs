@@ -142,7 +142,9 @@ impl Rpc {
         })?;
         self.control.check()?;
         *bytes_read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let envelope: Value = serde_json::from_slice(&bytes).context("invalid RPC JSON")?;
+        // A proxy in front of the node or OSS answers errors (401, 502) with HTML.
+        let envelope: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("{method}: invalid RPC JSON (HTTP {status})"))?;
         if !envelope["error"].is_null() {
             return Err(RpcError {
                 code: envelope["error"]["code"].as_i64(),
