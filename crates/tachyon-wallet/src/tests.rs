@@ -10,7 +10,7 @@ use zcash_tachyon::{
     constants::EPOCH_SIZE, keys::private::SpendingKey,
 };
 
-use oss::testing::{FakeNode, OssHandle, TempDb, spawn_oss};
+use oss::testing::{FakeNode, OssHandle, TempDb, spawn_oss_with};
 use oss_core::TachyonStamp as Stamp;
 
 use crate::{
@@ -44,9 +44,14 @@ struct Remote {
 
 impl Remote {
     fn start(blocks: &[Block]) -> Result<Self> {
+        Self::start_with(blocks, &[])
+    }
+
+    /// [`Remote::start`] with extra `tachyon-oss` flags.
+    fn start_with(blocks: &[Block], flags: &[&str]) -> Result<Self> {
         let db = TempDb::new();
         let node = FakeNode::start(blocks.to_vec())?;
-        let (url, oss) = spawn_oss(&node.url, &db.0)?;
+        let (url, oss) = spawn_oss_with(&node.url, &db.0, flags)?;
         Ok(Self {
             oss,
             node,
@@ -88,6 +93,10 @@ fn prover_for<'a>(
 /// through `oss`.
 fn spend(blocks: &[Block], receipt: &Receipt, oss: Option<&Remote>) -> Result<()> {
     let chain = ChainData::Blocks(blocks);
+    spend_with(blocks, receipt, &prover_for(&chain, oss, blocks)?)
+}
+
+fn spend_with(blocks: &[Block], receipt: &Receipt, prover: &Prover<'_>) -> Result<()> {
     let sent = transaction::build(
         Payment {
             seed: SEED,
@@ -98,10 +107,49 @@ fn spend(blocks: &[Block], receipt: &Receipt, oss: Option<&Remote>) -> Result<()
             transparent_output: None,
             expiry: blocks.last().unwrap().height + 20,
         },
-        &prover_for(&chain, oss, blocks)?,
+        prover,
         &Control::new(true),
     )?;
     transaction::verify_for_test(&sent, None)
+}
+
+#[test]
+fn same_epoch_spend_proves_its_spans_without_the_oss() -> Result<()> {
+    let mut blocks = vec![genesis()];
+    let receipt = own(1_000_000);
+    let tx = shield(&blocks, &receipt)?;
+    mine(&mut blocks, Some(&tx))?;
+    populate_epoch(&mut blocks, 3)?; // A later stamp, so the spend needs a span.
+    // Nothing listens here, so any OSS request fails the spend.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let dead = Oss::new(
+        &format!("http://127.0.0.1:{port}"),
+        None,
+        &Control::new(true),
+    )?;
+    spend_with(
+        &blocks,
+        &receipt,
+        &Prover::Remote(&dead, &ChainData::Blocks(&blocks)),
+    )
+}
+
+#[test]
+fn remote_proves_epochs_below_the_oss_archive_locally() -> Result<()> {
+    let mut blocks = vec![genesis()];
+    let receipt = own(1_000_000);
+    let tx = shield(&blocks, &receipt)?;
+    mine(&mut blocks, Some(&tx))?;
+    while blocks.last().unwrap().epoch < 2 {
+        mine(&mut blocks, None)?;
+    }
+    // The OSS archives from epoch 1: the note's epoch 0 is `Unavailable` there
+    // and proven locally, then epoch 1 and the spans come from the OSS.
+    let start = blocks.iter().find(|b| b.epoch == 1).unwrap().height;
+    let oss = Remote::start_with(&blocks, &["--start-height", &start.to_string()])?;
+    spend(&blocks, &receipt, Some(&oss))
 }
 
 #[test]

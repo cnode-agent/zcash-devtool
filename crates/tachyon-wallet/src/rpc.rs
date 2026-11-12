@@ -220,6 +220,12 @@ impl Rpc {
     }
 }
 
+/// Whether `error` is an OSS `Unavailable` answer: outside its archive, or no
+/// longer canonical.
+pub(crate) fn unavailable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RpcError>().and_then(|e| e.code) == Some(ErrorCode::Unavailable.code())
+}
+
 /// The OSS client (design §4.1): an [`Rpc`] with a 64 MiB body cap, which
 /// waits out `NotReady` and turns the other OSS errors into clear ones.
 pub struct Oss {

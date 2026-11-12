@@ -23,7 +23,7 @@ use zcash_tachyon::{
 use crate::{
     chain::{self, anchor, anchor_hex},
     control::Control,
-    rpc::Oss,
+    rpc::{Oss, unavailable},
     store::ChainData,
 };
 
@@ -102,6 +102,36 @@ fn on_chain(
         ))
 }
 
+/// `epoch`'s OSS bucket whose profile holds `value`, checked against `chain`.
+fn remote_bucket(
+    oss: &Oss,
+    chain: &ChainData<'_>,
+    epoch: u32,
+    value: Fp,
+    control: &Control,
+) -> Result<Pcd<qr::QrBucket>> {
+    control.stage(format!("Requesting closed epoch {epoch} bucket…"))?;
+    let EpochResult { evidence, .. } = oss.call("oss_epoch", EpochParams { epoch })?;
+    let (EvidenceStatus::Ready, Some(r0), Some(profiles)) =
+        (evidence.status, evidence.discriminant, evidence.profiles)
+    else {
+        bail!(
+            "OSS not ready: epoch {epoch} evidence is {:?}",
+            evidence.status
+        );
+    };
+    let r0 = QrDiscriminant(Fp::from_bytes(bytes32(&r0)?).context("invalid OSS discriminant")?);
+    let profiles: Vec<_> = profiles.iter().map(|p| p.profile).collect();
+    let profile = profile_of(value, r0, &profiles).context("no OSS bucket on the routing path")?;
+    let BucketResult { pcd } = oss.call("oss_bucket", BucketParams { epoch, profile })?;
+    let bucket = pcd_from_hex::<qr::QrBucket>(&pcd)?;
+    ensure!(
+        on_chain(chain, &bucket, epoch, r0, profile)? && verify_pcd(&bucket)?,
+        "the OSS bucket of epoch {epoch} does not verify on the synced chain{REVS}"
+    );
+    Ok(bucket)
+}
+
 impl Prover<'_> {
     /// One segment proving `nfs[i]` absent from epoch `epoch_start + i`.
     /// Fails if any of them is published: the note is spent.
@@ -120,24 +150,25 @@ impl Prover<'_> {
                 "note is spent: its epoch {epoch} nullifier is published"
             );
         }
-        match self {
-            Self::Local(_) => {}
-            Self::Remote(oss, _) => {
-                control.stage(format!(
-                    "Requesting unspent evidence for {} epochs from {epoch_start}…",
-                    nfs.len()
-                ))?;
-                let UnspentResult { pcd, .. } = oss.call(
-                    "oss_unspent",
-                    UnspentParams {
-                        epoch_start,
-                        nullifiers: nfs
-                            .iter()
-                            .map(|nf| hex::encode(Fp::from(*nf).to_bytes()))
-                            .collect(),
-                    },
-                )?;
-                let segment = pcd_from_hex::<pool::ArbitraryUnspent>(&pcd)?;
+        if let Self::Remote(oss, _) = self {
+            control.stage(format!(
+                "Requesting unspent evidence for {} epochs from {epoch_start}…",
+                nfs.len()
+            ))?;
+            let answer = oss.call::<UnspentResult>(
+                "oss_unspent",
+                UnspentParams {
+                    epoch_start,
+                    nullifiers: nfs
+                        .iter()
+                        .map(|nf| hex::encode(Fp::from(*nf).to_bytes()))
+                        .collect(),
+                },
+            );
+            // Epochs older than the OSS archive (`--start-height`): fall through
+            // and prove them from this wallet's own blocks, instead of failing.
+            if !matches!(&answer, Err(error) if unavailable(error)) {
+                let segment = pcd_from_hex::<pool::ArbitraryUnspent>(&answer?.pcd)?;
                 let next = epoch_start + u32::try_from(nfs.len())?;
                 let expected = (
                     chain.epoch_sentinel(epoch_start)?,
@@ -156,8 +187,10 @@ impl Prover<'_> {
             "Proving unspent evidence for {} epochs from {epoch_start}…",
             nfs.len()
         ))?;
+        // Local buckets throughout: a remote lookup would ask the OSS again
+        // about epochs it just refused.
         prove_unspent(epoch_start, nfs, |epoch, value| {
-            self.bucket_for(epoch, value, control)
+            Prover::Local(chain).bucket_for(epoch, value, control)
         })
     }
 
@@ -170,32 +203,12 @@ impl Prover<'_> {
     ) -> Result<Pcd<qr::QrBucket>> {
         let chain = match self {
             Self::Local(chain) => chain,
-            Self::Remote(oss, chain) => {
-                control.stage(format!("Requesting closed epoch {epoch} bucket…"))?;
-                let EpochResult { evidence, .. } = oss.call("oss_epoch", EpochParams { epoch })?;
-                let (EvidenceStatus::Ready, Some(r0), Some(profiles)) =
-                    (evidence.status, evidence.discriminant, evidence.profiles)
-                else {
-                    bail!(
-                        "OSS not ready: epoch {epoch} evidence is {:?}",
-                        evidence.status
-                    );
-                };
-                let r0 = QrDiscriminant(
-                    Fp::from_bytes(bytes32(&r0)?).context("invalid OSS discriminant")?,
-                );
-                let profiles: Vec<_> = profiles.iter().map(|p| p.profile).collect();
-                let profile = profile_of(value, r0, &profiles)
-                    .context("no OSS bucket on the routing path")?;
-                let BucketResult { pcd } =
-                    oss.call("oss_bucket", BucketParams { epoch, profile })?;
-                let bucket = pcd_from_hex::<qr::QrBucket>(&pcd)?;
-                ensure!(
-                    on_chain(chain, &bucket, epoch, r0, profile)? && verify_pcd(&bucket)?,
-                    "the OSS bucket of epoch {epoch} does not verify on the synced chain{REVS}"
-                );
-                return Ok(bucket);
-            }
+            Self::Remote(oss, chain) => match remote_bucket(oss, chain, epoch, value, control) {
+                // As in `unspent`: seal an epoch older than the OSS archive
+                // from this wallet's own blocks.
+                Err(error) if unavailable(&error) => chain,
+                answer => return answer,
+            },
         };
         let r0 = QrDiscriminant(Fp::ONE);
         // A row counts only if it verifies and sits on this chain's entry anchors.
@@ -243,11 +256,20 @@ impl Prover<'_> {
     pub fn spans(&self, from: &[Anchor], control: &Control) -> Result<Spans> {
         let chain = match self {
             Self::Local(chain) => chain,
-            Self::Remote(oss, _) => {
-                control.stage("Requesting anchor spans…")?;
-                let from_hex = from.iter().map(|a| anchor_hex(*a)).collect();
-                let answer = oss.call("oss_anchorspans", AnchorSpansParams { from: from_hex })?;
-                return checked_spans(from, answer);
+            Self::Remote(oss, chain) => {
+                // Only the epoch's entry anchor, shared by every note from a
+                // closed epoch, goes to the OSS. A note created this epoch starts
+                // right after its creation stamp, which would tell the OSS the
+                // creating transaction, so its spans are proven here.
+                let entry = chain.epoch_sentinel(chain.tip()?.epoch)?;
+                if from.iter().all(|a| *a == entry) {
+                    control.stage("Requesting anchor spans…")?;
+                    let from_hex = from.iter().map(|a| anchor_hex(*a)).collect();
+                    let answer =
+                        oss.call("oss_anchorspans", AnchorSpansParams { from: from_hex })?;
+                    return checked_spans(from, answer);
+                }
+                chain
             }
         };
         let tip = chain.tip()?;
