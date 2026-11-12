@@ -36,13 +36,12 @@ ragu_core = { git = "https://github.com/tachyon-zcash/ragu", rev = "839cf50d1ff3
 primitives = { package = "zakura-primitives", git = "https://github.com/cnode-agent/common.git", rev = "b20577b61e92d9b081790e7eb8f54bbc20047f97", default-features = false, features = ["std"] }
 protocol = { package = "zakura-protocol", git = "https://github.com/cnode-agent/common.git", rev = "b20577b61e92d9b081790e7eb8f54bbc20047f97" }
 transparent = { package = "zakura-transparent", git = "https://github.com/cnode-agent/common.git", rev = "b20577b61e92d9b081790e7eb8f54bbc20047f97" }
-# T10 switches this to a git rev.
-oss-core = { path = "../../../../oss/crates/oss-core" }
+oss-core = { git = "https://github.com/S1nus/oss-tachyon.git", rev = "fc9ad817d961631a023547c081eec7d1248c6399" }
 
 [dev-dependencies]
 tempfile = "3"
 # The OSS server and its fake node, for remote-mode tests.
-oss = { path = "../../../../oss/crates/oss", features = ["testing"] }
+oss = { git = "https://github.com/S1nus/oss-tachyon.git", rev = "fc9ad817d961631a023547c081eec7d1248c6399", features = ["testing"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nutachyon"))'] }
