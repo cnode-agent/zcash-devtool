@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use oss_core::{
-    BlockParams, ErrorCode, InfoParams, InfoResult, MAX_TACHYGRAM_VALUES, NotReadyData, SpentData,
-    TachygramsParams, TachygramsResult,
+    BlockParams, BlocksParams, BlocksResult, ErrorCode, InfoParams, InfoResult,
+    MAX_TACHYGRAM_VALUES, NotReadyData, SpentData, TachygramsParams, TachygramsResult,
 };
 use reqwest::{Client, Url};
 use serde::{Serialize, de::DeserializeOwned};
@@ -104,12 +104,72 @@ impl Rpc {
         params: Value,
         bytes_read: &mut u64,
     ) -> Result<T> {
+        let request = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
+        let (status, envelope) = self.post(method, &request, bytes_read)?;
+        Ok(serde_json::from_value(answer(
+            method, status, envelope, 1,
+        )?)?)
+    }
+
+    /// `method` once per entry of `params`, in one JSON-RPC batch request.
+    /// Each answer is its own result, in order.
+    pub fn batch(&self, method: &str, params: Vec<Value>) -> Result<Vec<Result<Value>>> {
+        let started = Instant::now();
+        let mut bytes_read = 0u64;
+        let count = params.len();
+        let requests = params
+            .into_iter()
+            .enumerate()
+            .map(|(id, params)| json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            .collect();
+        let result = self
+            .post(method, &Value::Array(requests), &mut bytes_read)
+            .and_then(|(status, answers)| {
+                let Value::Array(answers) = answers else {
+                    answer(method, status, answers, 0)?; // A rejected batch is one error.
+                    bail!("{method}: expected a batch answer");
+                };
+                ensure!(
+                    answers.len() == count,
+                    "{method}: {} answers to a batch of {count}",
+                    answers.len()
+                );
+                let mut results: Vec<Option<Result<Value>>> = (0..count).map(|_| None).collect();
+                for envelope in answers {
+                    let id = envelope["id"]
+                        .as_u64()
+                        .and_then(|id| usize::try_from(id).ok());
+                    let slot = id
+                        .and_then(|id| results.get_mut(id))
+                        .filter(|slot| slot.is_none())
+                        .context("RPC batch answer ID mismatch")?;
+                    *slot = Some(answer(
+                        method,
+                        status,
+                        envelope,
+                        id.expect("matched a slot"),
+                    ));
+                }
+                Ok(results
+                    .into_iter()
+                    .map(|r| r.expect("each ID answered once"))
+                    .collect())
+            });
+        self.control
+            .record_rpc(method, started.elapsed(), bytes_read);
+        result
+    }
+
+    /// Sends `body` and parses the JSON answer: cancellable, within the body cap.
+    fn post(
+        &self,
+        method: &str,
+        body: &Value,
+        bytes_read: &mut u64,
+    ) -> Result<(reqwest::StatusCode, Value)> {
         // Never log params: they can include addresses, raw payments or secrets.
         self.control.stage(format!("Requesting {method}…"))?;
-        let mut request = self
-            .client
-            .post(self.url.clone())
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}));
+        let mut request = self.client.post(self.url.clone()).json(body);
         if let Some(path) = &self.cookie {
             let cookie = std::fs::read_to_string(path).context("cannot read RPC cookie")?;
             let (user, password) = cookie
@@ -143,24 +203,9 @@ impl Rpc {
         self.control.check()?;
         *bytes_read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         // A proxy in front of the node or OSS answers errors (401, 502) with HTML.
-        let envelope: Value = serde_json::from_slice(&bytes)
+        let answer = serde_json::from_slice(&bytes)
             .with_context(|| format!("{method}: invalid RPC JSON (HTTP {status})"))?;
-        if !envelope["error"].is_null() {
-            return Err(RpcError {
-                code: envelope["error"]["code"].as_i64(),
-                method: method.into(),
-                error: envelope["error"].clone(),
-            }
-            .into());
-        }
-        ensure!(status.is_success(), "{method}: HTTP {status}");
-        ensure!(envelope["id"] == 1, "RPC response ID mismatch");
-        Ok(serde_json::from_value(
-            envelope
-                .get("result")
-                .context("missing RPC result")?
-                .clone(),
-        )?)
+        Ok((status, answer))
     }
 
     pub fn hash(&self, height: u32) -> Result<String> {
@@ -194,23 +239,9 @@ impl Rpc {
     /// txids of its stamps.
     // shortcut: transparent-only transactions in pruned blocks never show as
     // mined; have `oss_block` carry every txid if that starts to matter.
-    pub fn with_transactions(&self, mut block: Block, archived: bool) -> Result<Block> {
-        let ordinary: Value = match self.call("getblock", json!([block.hash, 1])) {
-            Err(error) if archived && error.is::<RpcError>() => {
-                block.transactions = block.stamps.iter().map(|s| s.txid.clone()).collect();
-                return Ok(block);
-            }
-            result => result?,
-        };
-        ensure!(ordinary["hash"] == block.hash, "getblock identity mismatch");
-        block.transactions = serde_json::from_value(ordinary["tx"].clone())?;
-        for stamp in &block.stamps {
-            ensure!(
-                block.transactions.get(stamp.transaction_index) == Some(&stamp.txid),
-                "stamp transaction position mismatch"
-            );
-        }
-        Ok(block)
+    pub fn with_transactions(&self, block: Block, archived: bool) -> Result<Block> {
+        let ordinary = self.call("getblock", json!([block.hash, 1]));
+        attach_transactions(block, ordinary, archived)
     }
 
     pub fn submit(&self, txid: &str, raw: &str) -> Result<()> {
@@ -223,6 +254,54 @@ impl Rpc {
         );
         Ok(())
     }
+}
+
+/// One JSON-RPC answer's result, or its error.
+fn answer(
+    method: &str,
+    status: reqwest::StatusCode,
+    mut envelope: Value,
+    id: usize,
+) -> Result<Value> {
+    if !envelope["error"].is_null() {
+        return Err(RpcError {
+            code: envelope["error"]["code"].as_i64(),
+            method: method.into(),
+            error: envelope["error"].clone(),
+        }
+        .into());
+    }
+    ensure!(status.is_success(), "{method}: HTTP {status}");
+    ensure!(envelope["id"] == id, "RPC response ID mismatch");
+    envelope
+        .get_mut("result")
+        .map(Value::take)
+        .context("missing RPC result")
+}
+
+/// Sets the block's transaction list from its `getblock` answer (see
+/// [`Rpc::with_transactions`]).
+pub(crate) fn attach_transactions(
+    mut block: Block,
+    ordinary: Result<Value>,
+    archived: bool,
+) -> Result<Block> {
+    let ordinary = match ordinary {
+        Err(error) if archived && error.is::<RpcError>() => {
+            block.transactions = block.stamps.iter().map(|s| s.txid.clone()).collect();
+            return Ok(block);
+        }
+        result => result?,
+    };
+    ensure!(ordinary["hash"] == block.hash, "getblock identity mismatch");
+    block.transactions = serde_json::from_value(ordinary["tx"].clone())?;
+    for stamp in &block.stamps {
+        ensure!(
+            block.transactions.get(stamp.transaction_index) == Some(&stamp.txid),
+            "stamp transaction position mismatch"
+        );
+    }
+    Ok(block)
 }
 
 /// Whether `error` is an OSS `Unavailable` answer: outside its archive, or no
@@ -344,6 +423,23 @@ impl Oss {
         let block: Block = self.call("oss_block", BlockParams { height, thin })?;
         ensure!(block.height == height, "oss_block height mismatch");
         Ok(block)
+    }
+
+    /// Blocks `from..from + count` as [`Oss::block`] serves them, in one
+    /// request. The OSS may answer fewer, never none.
+    pub fn blocks(&self, from: u32, count: u32, thin: bool) -> Result<Vec<Block>> {
+        let BlocksResult { blocks } =
+            self.call("oss_blocks", BlocksParams { from, count, thin })?;
+        ensure!(
+            !blocks.is_empty()
+                && blocks.len() <= count as usize
+                && blocks
+                    .iter()
+                    .zip(from..)
+                    .all(|(block, h)| block.height == h),
+            "oss_blocks answered other heights than {count} from {from}"
+        );
+        Ok(blocks)
     }
 
     /// Where each value is published in the OSS archive, if anywhere.

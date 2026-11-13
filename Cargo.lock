@@ -4779,7 +4779,7 @@ dependencies = [
 [[package]]
 name = "oss"
 version = "0.1.0"
-source = "git+https://github.com/S1nus/oss-tachyon.git?rev=0c5653c85caaea13ea71a9fa2313e4f05758f74f#0c5653c85caaea13ea71a9fa2313e4f05758f74f"
+source = "git+https://github.com/S1nus/oss-tachyon.git?rev=42a3859095fac92385deb63dc27d577277d6f713#42a3859095fac92385deb63dc27d577277d6f713"
 dependencies = [
  "anyhow",
  "axum",
@@ -4805,7 +4805,7 @@ dependencies = [
 [[package]]
 name = "oss-core"
 version = "0.1.0"
-source = "git+https://github.com/S1nus/oss-tachyon.git?rev=0c5653c85caaea13ea71a9fa2313e4f05758f74f#0c5653c85caaea13ea71a9fa2313e4f05758f74f"
+source = "git+https://github.com/S1nus/oss-tachyon.git?rev=42a3859095fac92385deb63dc27d577277d6f713#42a3859095fac92385deb63dc27d577277d6f713"
 dependencies = [
  "anyhow",
  "hex",

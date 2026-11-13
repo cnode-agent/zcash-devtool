@@ -4,8 +4,10 @@ use super::*;
 use crate::{
     chain::{self, Block},
     note::Locator,
-    rpc::RpcError,
+    rpc::{self, RpcError},
 };
+use oss_core::MAX_BLOCKS;
+use std::collections::BTreeMap;
 
 /// Remote mode: the OSS and the first height it archives. Tachyon blocks from
 /// that height up come from the OSS (design §4.3).
@@ -73,6 +75,59 @@ impl SyncCache {
         self.blocks.insert(height, block.clone());
         self.fetches += 1;
         Ok(block)
+    }
+
+    /// Blocks `from..=to` from the OSS, each checked against the node's block
+    /// at its height. One `getblock` batch gives the node's hashes and
+    /// transaction lists; `oss_blocks` pages fetch the blocks not cached.
+    fn fetch_range(
+        &mut self,
+        rpc: &Rpc,
+        oss: &Oss,
+        from: u32,
+        to: u32,
+        thin: bool,
+    ) -> Result<BTreeMap<u32, Block>> {
+        let ordinary = rpc.batch(
+            "getblock",
+            (from..=to).map(|h| json!([h.to_string(), 1])).collect(),
+        )?;
+        let mut page = BTreeMap::new();
+        let mut blocks = BTreeMap::new();
+        for (height, ordinary) in (from..=to).zip(ordinary) {
+            let hash = match &ordinary {
+                Ok(header) => header["hash"]
+                    .as_str()
+                    .context("getblock without a hash")?
+                    .to_owned(),
+                // A pruned body has no `getblock`: ask for the hash alone.
+                Err(_) => rpc.hash(height)?,
+            };
+            if let Some(block) = self
+                .blocks
+                .get(&height)
+                .filter(|block| block.hash == hash && (thin || !block.is_thin()))
+            {
+                blocks.insert(height, block.clone());
+                continue;
+            }
+            if !page.contains_key(&height) {
+                page = oss
+                    .blocks(height, to - height + 1, thin)?
+                    .into_iter()
+                    .map(|block| (block.height, block))
+                    .collect();
+            }
+            let block = page
+                .remove(&height)
+                .expect("an OSS page starts at its first height");
+            ensure!(block.hash == hash, "Tachyon block changed during fetch");
+            let block = rpc::attach_transactions(block, ordinary, true)?;
+            self.blocks.insert(height, block.clone());
+            self.fetches += 1;
+            blocks.insert(height, block);
+        }
+        Ok(blocks)
     }
 
     /// `thin`: the block may be a thin copy.
@@ -353,6 +408,8 @@ pub(crate) fn sync_with_cache(
             && (height - config.activation) / EPOCH_SIZE < current_epoch
     };
     let fetch_thin = |height| from_height.is_none() && thin(height);
+    // Blocks fetched a page ahead from the OSS.
+    let mut ahead = BTreeMap::new();
     control.stage(format!(
         "Syncing heights {}–{stop} (node tip {tip})…",
         start.saturating_add(1).min(stop)
@@ -370,6 +427,23 @@ pub(crate) fn sync_with_cache(
                     .unwrap()
                     .fetch(&rpc, archive, height, fetch_thin(height))?
             }
+        } else if let Some((oss, _)) = archive.filter(|(_, from)| height >= *from) {
+            if !ahead.contains_key(&height) {
+                // A page never mixes thin and full blocks.
+                let thin = fetch_thin(height);
+                let to = (height..=stop)
+                    .take(MAX_BLOCKS as usize)
+                    .take_while(|h| fetch_thin(*h) == thin)
+                    .last()
+                    .unwrap_or(height);
+                ahead = cache
+                    .lock()
+                    .unwrap()
+                    .fetch_range(&rpc, oss, height, to, thin)?;
+            }
+            ahead
+                .remove(&height)
+                .expect("fetch_range returns every height")
         } else {
             cache
                 .lock()
