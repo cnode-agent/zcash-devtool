@@ -31,12 +31,12 @@ New wallets use the current tip as their birthday and trust the configured node'
 Sync downloads and validates chain data to update your wallet's note status and balances.
 
 ```sh
-"$DEVTOOL" tachyon --wallet-dir "$WALLET" sync --max-blocks 10000
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" sync --oss-url https://oss.cnode.phd --max-blocks 10000
 ```
 
 Repeat until `caught_up` is `true`.
 
-Importing an older receipt automatically extends the scan to its creation epoch. For a legacy receipt without a transaction ID, use `sync --from-height HEIGHT --max-blocks 10000` to search from a known height (or 8 if unknown). Pruned history requires an archive node; proof-service recovery is not yet supported.
+Importing an older receipt automatically extends the scan to its creation epoch. For a legacy receipt without a transaction ID, use `sync --oss-url https://oss.cnode.phd --from-height HEIGHT --max-blocks 10000` to search from a known height (or 8 if unknown). Pruned history is served by the OSS.
 
 ## Receive (Tachyon)
 
@@ -45,7 +45,7 @@ Get funds from the [faucet](https://tachyscan.cnode.phd/faucet) using your `tach
 ```sh
 "$DEVTOOL" tachyon --wallet-dir "$WALLET" receive \
   --receipt "$HOME/Downloads/faucet-note.json"
-"$DEVTOOL" tachyon --wallet-dir "$WALLET" sync --max-blocks 10000
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" sync --oss-url https://oss.cnode.phd --max-blocks 10000
 "$DEVTOOL" tachyon --wallet-dir "$WALLET" balance
 ```
 
@@ -56,7 +56,7 @@ New receipts include a transaction locator. For an older receipt, add `--txid PA
 ## Send (Tachyon)
 
 ```sh
-"$DEVTOOL" tachyon --wallet-dir "$WALLET" send \
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" send --oss-url https://oss.cnode.phd \
   --to 'tachyon-test:RECIPIENT_PAYMENT_KEY' --amount-zat 1000000
 "$DEVTOOL" tachyon --wallet-dir "$WALLET" export-receipt \
   --txid PAYMENT_TXID --out "$HOME/payment.json"
@@ -68,7 +68,7 @@ Exports include the transaction ID, plus its block height and hash when known to
 
 ## Closed epochs
 
-The first payment that needs a closed epoch proves that epoch's QR buckets and caches all of them in the wallet database. A cached bucket is reused only if it verifies and matches the synced chain's epoch entry anchors; otherwise it is rebuilt.
+The OSS proves closed epochs, and the wallet verifies each proof. Without `--oss-url`, the first payment that needs a closed epoch proves that epoch's QR buckets and caches all of them in the wallet database. A cached bucket is reused only if it verifies and matches the synced chain's epoch entry anchors; otherwise it is rebuilt.
 
 ## License
 
