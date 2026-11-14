@@ -30,6 +30,8 @@ struct NodeData {
     fail_funding_sync: bool,
     funding_hash_override: Option<String>,
     earlier_blocks: BTreeMap<u32, Value>,
+    /// An OSS follows this node: answer its `getblock`, which devtool never sends.
+    serves_oss: bool,
     cancel_request: Option<(String, Option<Value>, Control)>,
     requests: Vec<(String, Value)>,
     pruned_heights: BTreeSet<u32>,
@@ -66,6 +68,7 @@ impl Node {
             fail_funding_sync: false,
             funding_hash_override: None,
             earlier_blocks: BTreeMap::new(),
+            serves_oss: false,
             cancel_request: None,
             requests: vec![],
             pruned_heights: BTreeSet::new(),
@@ -117,7 +120,9 @@ impl Node {
                     vec![request]
                 };
                 if batch {
-                    data.requests.push(("batch".into(), json!(entries.len())));
+                    let method = entries[0]["method"].as_str().unwrap();
+                    data.requests
+                        .push((format!("batch:{method}"), json!(entries.len())));
                 }
                 let mut answers = Vec::new();
                 for request in entries {
@@ -126,7 +131,11 @@ impl Node {
                         .push((request["method"].as_str().unwrap().into(), params.clone()));
                     let mut error = Value::Null;
                     let result = match request["method"].as_str().unwrap() {
-                        "getblockchaininfo" => json!({"chain":"test"}),
+                        "getblockchaininfo" => {
+                            let pruned = data.zakura_pruning && !data.pruned_heights.is_empty();
+                            let below = data.pruned_heights.last().map(|h| h + 1);
+                            json!({"chain":"test","pruned":pruned,"pruneheight":below})
+                        }
                         "getblockcount" => json!(data.blocks.last().unwrap().height),
                         "getbestblockhash" => json!(data.blocks.last().unwrap().hash),
                         "getaddressutxos" => {
@@ -164,40 +173,33 @@ impl Node {
                                 )
                             }
                         }
-                        "getblock" => {
-                            let id = params[0].as_str().unwrap();
-                            if let Some(block) = id
-                                .parse::<u32>()
-                                .ok()
-                                .and_then(|height| data.earlier_blocks.get(&height))
-                            {
-                                block.clone()
-                            } else {
-                                let block = data
-                                    .blocks
-                                    .iter()
-                                    .find(|b| {
-                                        b.hash == id || Some(b.height) == id.parse::<u32>().ok()
-                                    })
-                                    .unwrap();
-                                if data.zakura_pruning
-                                    && data.pruned_heights.contains(&block.height)
-                                {
-                                    error = json!({"code":-1,"message":"block not found"});
-                                }
-                                json!({"hash":block.hash,"height":block.height,"tx":block.transactions})
-                            }
+                        "getblock" if data.serves_oss => {
+                            let block = data
+                                .blocks
+                                .iter()
+                                .find(|b| params[0] == b.hash.as_str())
+                                .unwrap();
+                            json!({"hash":block.hash,"height":block.height,"tx":block.transactions})
                         }
                         "gettxout" => {
-                            assert_eq!(params[2], true);
+                            assert!(params[2].is_boolean());
                             let key = (
                                 params[0].as_str().unwrap().to_owned(),
                                 u32::try_from(params[1].as_u64().unwrap()).unwrap(),
                             );
+                            // A coinbase is its block's first transaction.
+                            let coinbase = data
+                                .blocks
+                                .iter()
+                                .any(|b| b.transactions.first() == Some(&key.0))
+                                || data
+                                    .earlier_blocks
+                                    .values()
+                                    .any(|b| b["tx"][0] == key.0.as_str());
                             data.txout_overrides
                                 .get(&key)
                                 .cloned()
-                                .unwrap_or_else(|| json!({"confirmations":100,"coinbase":false}))
+                                .unwrap_or_else(|| json!({"confirmations":100,"coinbase":coinbase}))
                         }
                         "getrawtransaction" if params[1] == 1 => {
                             let txid = params[0].as_str().unwrap();
@@ -210,7 +212,9 @@ impl Node {
                                         && data.pruned_heights.contains(&block.height))
                                 })
                             {
-                                json!({"txid":txid,"blockhash":block.hash})
+                                let tip = data.blocks.last().unwrap().height;
+                                json!({"txid":txid,"blockhash":block.hash,"height":block.height,
+                                    "confirmations":tip - block.height + 1})
                             } else if data.mempool.iter().any(|raw| {
                                 Transaction::read(
                                     &hex::decode(raw).unwrap()[..],
@@ -354,6 +358,12 @@ fn command_with_id(dir: &std::path::Path, command: Operation, id: Option<&str>) 
     .execute()
 }
 /// Runs `command` in remote mode, against the OSS at `url`.
+/// Starts an OSS that follows `node`.
+fn spawn_oss(node: &Node, db: &oss::testing::TempDb) -> Result<(String, oss::testing::OssHandle)> {
+    node.data.lock().unwrap().serves_oss = true;
+    oss::testing::spawn_oss(&node.url, &db.0)
+}
+
 fn remote(dir: &std::path::Path, url: &str, command: Operation) -> Result<Value> {
     Command {
         wallet_dir: dir.into(),
@@ -1316,6 +1326,10 @@ fn shield_rejects_invalid_amounts_insufficient_single_outputs_and_partial_coinba
     assert!(error.to_string().contains("cannot cover amount plus fee"));
     {
         let mut data = node.data.lock().unwrap();
+        // The funding becomes a mature coinbase: 100 confirmations by height too.
+        for _ in 0..100 {
+            crate::tests::mine(&mut data.blocks, None)?;
+        }
         for index in 0..2 {
             data.txout_overrides.insert(
                 (funding.txid().to_string(), index),
@@ -2022,7 +2036,7 @@ fn remote_wallet_syncs_and_spends_a_note_whose_block_the_node_pruned() -> Result
         }
     }
     let db = oss::testing::TempDb::new();
-    let (url, oss) = oss::testing::spawn_oss(&node.url, &db.0)?;
+    let (url, oss) = spawn_oss(&node, &db)?;
     oss.wait_built(20)?;
     {
         let mut data = node.data.lock().unwrap();
@@ -2032,7 +2046,7 @@ fn remote_wallet_syncs_and_spends_a_note_whose_block_the_node_pruned() -> Result
     assert_eq!(remote(&dir, &url, SYNC)?["caught_up"], true);
     assert_eq!(command(&dir, Operation::Balance)?["available_zat"], 100_000);
     let to = note::address(&SpendingKey::from([9; 32]));
-    remote(
+    let sent = remote(
         &dir,
         &url,
         Operation::Send {
@@ -2041,9 +2055,26 @@ fn remote_wallet_syncs_and_spends_a_note_whose_block_the_node_pruned() -> Result
         },
     )?;
     node.mine()?;
+    // The node prunes the send's block before the wallet syncs it: only the
+    // OSS transaction index can say the send was mined.
+    let mined_at = node.data.lock().unwrap().blocks.last().unwrap().height;
+    oss.wait_built(mined_at)?;
+    node.data
+        .lock()
+        .unwrap()
+        .pruned_heights
+        .extend(15..=mined_at);
     remote(&dir, &url, SYNC)?;
     let balance = command(&dir, Operation::Balance)?;
     assert_eq!(balance["available_zat"], 10_000, "{balance}");
+    let listed = command(&dir, Operation::Transactions)?;
+    let send = listed["transactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tx| tx["txid"] == sent["txid"])
+        .unwrap();
+    assert_eq!(send["status"], "mined", "{listed}");
     Ok(())
 }
 
@@ -2054,7 +2085,7 @@ fn remote_send_combines_two_notes() -> Result<()> {
     let dir = temp.path().join("wallet");
     shield_each(&node, &dir, &[200_000, 300_000])?;
     let db = oss::testing::TempDb::new();
-    let (url, _oss) = oss::testing::spawn_oss(&node.url, &db.0)?;
+    let (url, _oss) = spawn_oss(&node, &db)?;
     let own = command(&dir, Operation::Address)?["tachyon_address"]
         .as_str()
         .unwrap()
@@ -2176,7 +2207,7 @@ fn thin_sync_finds_a_spend_made_elsewhere_and_a_late_receipt() -> Result<()> {
         data.blocks.last().unwrap().height
     };
     let db = oss::testing::TempDb::new();
-    let (url, oss) = oss::testing::spawn_oss(&node.url, &db.0)?;
+    let (url, oss) = spawn_oss(&node, &db)?;
     oss.wait_ready(0)?;
     oss.wait_built(tip)?;
 
@@ -2185,17 +2216,20 @@ fn thin_sync_finds_a_spend_made_elsewhere_and_a_late_receipt() -> Result<()> {
     let before = Store::open_readonly(&stale)?.tip()?.unwrap().height;
     node.data.lock().unwrap().requests.clear();
     assert_eq!(remote(&stale, &url, ALL)?["caught_up"], true);
-    let batches: Vec<u64> = (node.data.lock().unwrap().requests.iter())
-        .filter(|(method, _)| method == "batch")
+    let requests = node.data.lock().unwrap().requests.clone();
+    let batches: Vec<u64> = (requests.iter())
+        .filter(|(method, _)| method == "batch:getblockhash")
         .map(|(_, entries)| entries.as_u64().unwrap())
         .collect();
     let synced = u64::from(tip - before);
     assert_eq!(batches.iter().sum::<u64>(), synced);
     // One page more at the switch from thin (epoch 0) to full (epoch 1).
     assert!(
-        batches.len() as u64 <= synced.div_ceil(100) + 1,
+        batches.len() as u64 <= synced.div_ceil(1000) + 1,
         "{batches:?}"
     );
+    // The OSS indexed every block before; devtool never asks for one.
+    assert!(!requests.iter().any(|(method, _)| method == "getblock"));
     assert_eq!(command(&stale, Operation::Balance)?["available_zat"], 0);
     assert!(Store::open_readonly(&stale)?.thin_epoch(0)?);
 
@@ -2209,7 +2243,20 @@ fn thin_sync_finds_a_spend_made_elsewhere_and_a_late_receipt() -> Result<()> {
         },
     )?;
     assert_eq!(remote(&bob, &url, ALL)?["caught_up"], true);
-    assert_eq!(command(&bob, Operation::Balance)?["available_zat"], 200_000);
+    let balance = command(&bob, Operation::Balance)?;
+    assert_eq!(balance["available_zat"], 200_000);
+
+    // After a rewind into epoch 0, as a reorg makes, the next sync checks
+    // epoch 0 through the OSS again: the epoch 1 row does not hide the note.
+    let id = balance["notes"][0]["id"].as_str().unwrap().to_owned();
+    {
+        let store = Store::open(&bob, false)?;
+        store.rewind(store.tachygram_height(&id)?.unwrap())?;
+        store.commit()?;
+    }
+    assert_eq!(remote(&bob, &url, ALL)?["caught_up"], true);
+    let epochs = Store::open_readonly(&bob)?.note_nullifier_epochs(&id)?;
+    assert!(epochs.contains(&0) && epochs.contains(&1), "{epochs:?}");
     let to = address(&alice)?;
     remote(
         &bob,

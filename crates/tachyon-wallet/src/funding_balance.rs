@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use protocol::value::Zatoshis;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::BTreeSet;
 
 use crate::{chain::bytes32, rpc::Rpc, store::Store, transaction};
@@ -126,7 +126,7 @@ impl AddressUtxos {
             .unwrap_or_default();
         let expected_script = transaction::transparent_script(address)?;
         let mut seen = BTreeSet::new();
-        let mut utxos = Vec::with_capacity(self.utxos.len());
+        let mut checked = Vec::with_capacity(self.utxos.len());
         for output in self.utxos {
             rpc.control.check()?;
             let txid = hex::encode(bytes32(&output.txid)?);
@@ -143,42 +143,53 @@ impl AddressUtxos {
                 output.height <= self.height,
                 "funding output is above the snapshot tip"
             );
+            checked.push((txid, output));
+        }
+        // Whether each output the previous snapshot did not classify is a
+        // coinbase, from `gettxout` rather than its block's transaction list.
+        // Confirmed outputs only: one spent in the mempool is still listed.
+        // privacy: no warning: the node already serves this address's UTXOs.
+        let unknown: Vec<(String, u32)> = checked
+            .iter()
+            .map(|(txid, output)| (txid.clone(), output.index))
+            .filter(|outpoint| {
+                previous_outputs
+                    .get(outpoint)
+                    .and_then(|o| o.coinbase)
+                    .is_none()
+            })
+            .collect();
+        let mut coinbase_of = std::collections::BTreeMap::new();
+        for chunk in unknown.chunks(1000) {
+            let answers = rpc.batch(
+                "gettxout",
+                chunk
+                    .iter()
+                    .map(|(txid, index)| json!([txid, index, false]))
+                    .collect(),
+            )?;
+            for (outpoint, answer) in chunk.iter().zip(answers) {
+                // Null: spent since `getaddressutxos`. Unknown until the next
+                // snapshot; spends recheck each input with `gettxout` anyway.
+                let coinbase = answer?["coinbase"].as_bool();
+                coinbase_of.insert(outpoint.clone(), coinbase);
+            }
+        }
+        let mut utxos = Vec::with_capacity(checked.len());
+        for (txid, output) in checked {
             let confirmations = u64::from(self.height - output.height) + 1;
-            let coinbase = if let Some(coinbase) = previous_outputs
-                .get(&(txid.clone(), output.index))
-                .and_then(|output| output.coinbase)
-            {
-                coinbase
-            } else {
-                let coinbase_txid = if let Some(block) = store.block(output.height)? {
-                    block.transactions.first().cloned()
-                } else {
-                    // Pre-activation funding can be outside the Tachyon feed.
-                    let response: Value =
-                        rpc.call("getblock", json!([output.height.to_string(), 1]))?;
-                    ensure!(
-                        response["height"].as_u64() == Some(u64::from(output.height)),
-                        "funding block height mismatch"
-                    );
-                    let hash = response["hash"]
-                        .as_str()
-                        .context("funding block has no hash")?;
-                    bytes32(hash)?;
-                    response["tx"]
-                        .as_array()
-                        .and_then(|transactions| transactions.first())
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                };
-                coinbase_txid.as_ref() == Some(&txid)
-            };
-            let immature_coinbase = coinbase && confirmations < COINBASE_MATURITY;
+            let outpoint = (txid.clone(), output.index);
+            let coinbase = previous_outputs
+                .get(&outpoint)
+                .and_then(|o| o.coinbase)
+                .or_else(|| coinbase_of[&outpoint]);
+            let immature_coinbase = coinbase == Some(true) && confirmations < COINBASE_MATURITY;
             utxos.push(Utxo {
                 txid,
                 index: output.index,
                 value_zat: output.satoshis,
                 immature_coinbase,
-                coinbase: Some(coinbase),
+                coinbase,
             });
         }
         Ok(Snapshot {

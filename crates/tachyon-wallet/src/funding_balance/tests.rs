@@ -15,19 +15,31 @@ fn store_with(blocks: &[Block]) -> Result<(tempfile::TempDir, Store)> {
     Ok((directory, store))
 }
 
+/// A node that answers one `gettxout` batch about one output.
+fn txout_node(coinbase: bool) -> Result<(String, std::thread::JoinHandle<()>)> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let node = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (mut request, mut chunk) = (Vec::new(), [0; 4096]);
+        while !request.ends_with(b"]") {
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0, "the client closed before sending its body");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        assert!(String::from_utf8_lossy(&request).contains("gettxout"));
+        let body = json!([{"jsonrpc":"2.0","id":0,"result":{"coinbase":coinbase}}]).to_string();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    Ok((url, node))
+}
+
 fn snapshot(height: u32, output_height: u32, coinbase: bool) -> Result<Snapshot> {
     let address = transaction::funding_address(crate::tests::SEED)?;
     let txid = "11".repeat(32);
     let mut origin = crate::tests::genesis();
     origin.height = output_height;
-    origin.transactions = vec![
-        if coinbase {
-            txid.clone()
-        } else {
-            "22".repeat(32)
-        },
-        txid.clone(),
-    ];
     let mut tip = origin.clone();
     tip.height = height;
     let response: AddressUtxos = serde_json::from_value(json!({
@@ -37,11 +49,14 @@ fn snapshot(height: u32, output_height: u32, coinbase: bool) -> Result<Snapshot>
             "satoshis": 625_000_000, "height": output_height}]
     }))?;
     let (_directory, store) = store_with(&[origin, tip])?;
-    response.into_snapshot(
-        &Rpc::new("http://127.0.0.1:1", None, &Control::new(true))?,
+    let (url, node) = txout_node(coinbase)?;
+    let snapshot = response.into_snapshot(
+        &Rpc::new(&url, None, &Control::new(true))?,
         &address,
         &store,
-    )
+    );
+    node.join().unwrap();
+    snapshot
 }
 
 #[test]

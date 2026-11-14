@@ -3,7 +3,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use oss_core::{
     BlockParams, BlocksParams, BlocksResult, ErrorCode, InfoParams, InfoResult,
-    MAX_TACHYGRAM_VALUES, NotReadyData, SpentData, TachygramsParams, TachygramsResult,
+    MAX_TACHYGRAM_VALUES, MAX_TRANSACTION_IDS, NotReadyData, SpentData, TachygramsParams,
+    TachygramsResult, TransactionsParams, TransactionsResult,
 };
 use reqwest::{Client, Url};
 use serde::{Serialize, de::DeserializeOwned};
@@ -228,20 +229,57 @@ impl Rpc {
         self.control.check()
     }
 
+    /// The Tachyon block at `height`. Callers check its hash with [`Rpc::hash`].
     pub fn block(&self, height: u32) -> Result<Block> {
         let block: Block = self.call("gettachyonblock", json!([height.to_string()]))?;
         ensure!(block.height == height, "gettachyonblock height mismatch");
-        self.with_transactions(block, false)
+        Ok(block)
     }
 
-    /// Fills in the block's transaction list from `getblock`. Zakura has none
-    /// for a pruned body, so an `archived` (OSS) block then keeps only the
-    /// txids of its stamps.
-    // shortcut: transparent-only transactions in pruned blocks never show as
-    // mined; have `oss_block` carry every txid if that starts to matter.
-    pub fn with_transactions(&self, block: Block, archived: bool) -> Result<Block> {
-        let ordinary = self.call("getblock", json!([block.hash, 1]));
-        attach_transactions(block, ordinary, archived)
+    /// The node's block hashes at `from..=to`, in one batch.
+    pub fn hashes(&self, from: u32, to: u32) -> Result<Vec<String>> {
+        let answers = self.batch("getblockhash", (from..=to).map(|h| json!([h])).collect())?;
+        answers
+            .into_iter()
+            .map(|answer| Ok(serde_json::from_value(answer?)?))
+            .collect()
+    }
+
+    /// The lowest height whose transactions the node still serves, if it
+    /// prunes: below it, `getrawtransaction` answers "not found" for mined
+    /// transactions too.
+    pub fn pruned_below(&self) -> Result<Option<u32>> {
+        let info: Value = self.call("getblockchaininfo", json!([]))?;
+        Ok((info["pruned"] == true).then(|| {
+            info["pruneheight"]
+                .as_u64()
+                .and_then(|height| u32::try_from(height).ok())
+                .unwrap_or(u32::MAX)
+        }))
+    }
+
+    /// Warns what a request reveals to the node, unless it runs on this machine.
+    pub(crate) fn privacy(&self, what: &str) {
+        let host = self.url.host_str().unwrap_or_default();
+        let local = host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !local {
+            self.control.privacy(what);
+        }
+    }
+
+    /// A client for the same server, for use on another thread.
+    pub(crate) fn fork(&self, control: &Control) -> Result<Self> {
+        Self::with_limits(
+            self.url.as_str(),
+            self.cookie.clone(),
+            control,
+            self.max_body,
+            self.timeout,
+        )
     }
 
     pub fn submit(&self, txid: &str, raw: &str) -> Result<()> {
@@ -279,29 +317,12 @@ fn answer(
         .context("missing RPC result")
 }
 
-/// Sets the block's transaction list from its `getblock` answer (see
-/// [`Rpc::with_transactions`]).
-pub(crate) fn attach_transactions(
-    mut block: Block,
-    ordinary: Result<Value>,
-    archived: bool,
-) -> Result<Block> {
-    let ordinary = match ordinary {
-        Err(error) if archived && error.is::<RpcError>() => {
-            block.transactions = block.stamps.iter().map(|s| s.txid.clone()).collect();
-            return Ok(block);
-        }
-        result => result?,
-    };
-    ensure!(ordinary["hash"] == block.hash, "getblock identity mismatch");
-    block.transactions = serde_json::from_value(ordinary["tx"].clone())?;
-    for stamp in &block.stamps {
-        ensure!(
-            block.transactions.get(stamp.transaction_index) == Some(&stamp.txid),
-            "stamp transaction position mismatch"
-        );
-    }
-    Ok(block)
+/// Whether `error` is the node's "No such mempool or main chain transaction".
+pub(crate) fn not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RpcError>()
+        .and_then(|error| error.code)
+        == Some(-5)
 }
 
 /// Whether `error` is an OSS `Unavailable` answer: outside its archive, or no
@@ -440,6 +461,37 @@ impl Oss {
             "oss_blocks answered other heights than {count} from {from}"
         );
         Ok(blocks)
+    }
+
+    /// A client for the same OSS, for use on another thread.
+    pub(crate) fn fork(&self, control: &Control) -> Result<Self> {
+        Ok(Self {
+            rpc: self.rpc.fork(control)?,
+            patience: self.patience,
+            verbose: self.verbose,
+        })
+    }
+
+    /// The archived height that mined each transaction, if any.
+    // privacy: the OSS learns every ID asked (see the callers' warnings).
+    pub fn transactions(&self, txids: &[String]) -> Result<Vec<Option<u32>>> {
+        let mut heights = Vec::with_capacity(txids.len());
+        for chunk in txids.chunks(MAX_TRANSACTION_IDS) {
+            let TransactionsResult { heights: answer } = self.call(
+                "oss_transactions",
+                TransactionsParams {
+                    txids: chunk.to_vec(),
+                },
+            )?;
+            ensure!(
+                answer.len() == chunk.len(),
+                "the OSS answered {} of {} transaction lookups",
+                answer.len(),
+                chunk.len()
+            );
+            heights.extend(answer);
+        }
+        Ok(heights)
     }
 
     /// Where each value is published in the OSS archive, if anywhere.

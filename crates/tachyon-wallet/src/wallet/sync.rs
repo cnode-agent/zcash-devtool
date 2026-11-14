@@ -3,11 +3,10 @@
 use super::*;
 use crate::{
     chain::{self, Block},
-    note::Locator,
     rpc::{self, RpcError},
 };
 use oss_core::MAX_BLOCKS;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Mutex};
 
 /// Remote mode: the OSS and the first height it archives. Tachyon blocks from
 /// that height up come from the OSS (design §4.3).
@@ -43,9 +42,7 @@ pub(super) fn checkpoint(
 // starts and when it is online.
 fn fetch_block(rpc: &Rpc, archive: Archive, height: u32, thin: bool) -> Result<Block> {
     match archive {
-        Some((oss, from)) if height >= from => oss
-            .block(height, thin)
-            .and_then(|block| rpc.with_transactions(block, true)),
+        Some((oss, from)) if height >= from => oss.block(height, thin),
         _ => rpc.block(height),
     }
     .with_context(|| format!(
@@ -75,59 +72,6 @@ impl SyncCache {
         self.blocks.insert(height, block.clone());
         self.fetches += 1;
         Ok(block)
-    }
-
-    /// Blocks `from..=to` from the OSS, each checked against the node's block
-    /// at its height. One `getblock` batch gives the node's hashes and
-    /// transaction lists; `oss_blocks` pages fetch the blocks not cached.
-    fn fetch_range(
-        &mut self,
-        rpc: &Rpc,
-        oss: &Oss,
-        from: u32,
-        to: u32,
-        thin: bool,
-    ) -> Result<BTreeMap<u32, Block>> {
-        let ordinary = rpc.batch(
-            "getblock",
-            (from..=to).map(|h| json!([h.to_string(), 1])).collect(),
-        )?;
-        let mut page = BTreeMap::new();
-        let mut blocks = BTreeMap::new();
-        for (height, ordinary) in (from..=to).zip(ordinary) {
-            let hash = match &ordinary {
-                Ok(header) => header["hash"]
-                    .as_str()
-                    .context("getblock without a hash")?
-                    .to_owned(),
-                // A pruned body has no `getblock`: ask for the hash alone.
-                Err(_) => rpc.hash(height)?,
-            };
-            if let Some(block) = self
-                .blocks
-                .get(&height)
-                .filter(|block| block.hash == hash && (thin || !block.is_thin()))
-            {
-                blocks.insert(height, block.clone());
-                continue;
-            }
-            if !page.contains_key(&height) {
-                page = oss
-                    .blocks(height, to - height + 1, thin)?
-                    .into_iter()
-                    .map(|block| (block.height, block))
-                    .collect();
-            }
-            let block = page
-                .remove(&height)
-                .expect("an OSS page starts at its first height");
-            ensure!(block.hash == hash, "Tachyon block changed during fetch");
-            let block = rpc::attach_transactions(block, ordinary, true)?;
-            self.blocks.insert(height, block.clone());
-            self.fetches += 1;
-            blocks.insert(height, block);
-        }
-        Ok(blocks)
     }
 
     /// `thin`: the block may be a thin copy.
@@ -163,58 +107,118 @@ impl SyncCache {
     }
 }
 
-/// Hints only narrow the search. Aggregation can put a leaf transaction's
-/// commitment in another transaction's stamp in the same block.
-fn contains_receipt(block: &Block, receipt: &Receipt, locator: &Locator) -> Result<bool> {
-    let cm = receipt.id()?;
-    Ok(block.transactions.contains(&locator.txid)
-        && block
-            .stamps
-            .iter()
-            .any(|stamp| stamp.tachygrams.contains(&cm)))
+/// Blocks `from..=to` from the OSS, each checked against the node's hash at
+/// its height (design §4.3). The `getblockhash` batch and the `oss_blocks`
+/// calls go out at once. A page `sync-many` already fetched for another
+/// wallet comes from the cache, which is not locked during requests.
+fn fetch_page(
+    cache: &Mutex<SyncCache>,
+    rpc: &Rpc,
+    oss: &Oss,
+    from: u32,
+    to: u32,
+    thin: bool,
+) -> Result<BTreeMap<u32, Block>> {
+    let cached: BTreeMap<u32, Block> = {
+        let cache = cache.lock().unwrap();
+        (from..=to)
+            .filter_map(|h| cache.blocks.get(&h).filter(|b| thin || !b.is_thin()))
+            .map(|block| (block.height, block.clone()))
+            .collect()
+    };
+    let complete = cached.len() == (from..=to).count();
+    let (hashes, fetched) = std::thread::scope(|scope| {
+        let fetched = (!complete).then(|| scope.spawn(|| oss_range(oss, from, to, thin)));
+        let hashes = rpc.hashes(from, to);
+        let fetched = fetched.map(|f| f.join().expect("the OSS fetch does not panic"));
+        (hashes, fetched.transpose())
+    });
+    let hashes = hashes?;
+    let matches = |blocks: &BTreeMap<u32, Block>| {
+        (from..=to)
+            .zip(&hashes)
+            .all(|(h, hash)| blocks.get(&h).is_some_and(|block| block.hash == *hash))
+    };
+    let fetched = match fetched? {
+        Some(fetched) => fetched,
+        None if matches(&cached) => return Ok(cached),
+        // The chain moved since another wallet cached this page.
+        None => oss_range(oss, from, to, thin)?,
+    };
+    ensure!(matches(&fetched), "Tachyon block changed during fetch");
+    let mut cache = cache.lock().unwrap();
+    cache.fetches += fetched.len();
+    cache.blocks.extend(fetched.clone());
+    Ok(fetched)
 }
 
+/// Blocks `from..=to` from the OSS, in as many calls as its size limit takes.
+fn oss_range(oss: &Oss, from: u32, to: u32, thin: bool) -> Result<BTreeMap<u32, Block>> {
+    let mut blocks = BTreeMap::new();
+    let mut next = from;
+    while next <= to {
+        for block in oss.blocks(next, to - next + 1, thin)? {
+            next = block.height + 1;
+            blocks.insert(block.height, block);
+        }
+    }
+    Ok(blocks)
+}
+
+/// Hints only narrow the search. Aggregation can put a leaf transaction's
+/// commitment in another transaction's stamp in the same block, so only the
+/// commitment is checked.
+fn contains_receipt(block: &Block, receipt: &Receipt) -> Result<bool> {
+    let cm = receipt.id()?;
+    Ok(block
+        .stamps
+        .iter()
+        .any(|stamp| stamp.tachygrams.contains(&cm)))
+}
+
+/// The full block at `height`, if it holds the receipt's note commitment:
+/// from the node, or from the OSS if the node pruned it. A block other than
+/// `expected` is a stale hint, and is not downloaded.
 fn located_block(
     rpc: &Rpc,
+    archive: Archive,
     height: u32,
+    expected: Option<&str>,
     receipt: &Receipt,
-    locator: &Locator,
     config: &Config,
     tip: u32,
 ) -> Result<Option<Block>> {
     if height < config.activation || height > tip {
         return Ok(None);
     }
-    // Check the cheap, retained block metadata first. A stale height hint must
-    // not require the payload of an unrelated, potentially pruned block.
-    // privacy: tells the node which block paid this wallet.
+    rpc.privacy(&format!(
+        "asked the node about block {height}, out of order: it may hold a payment to this wallet"
+    ));
     let hash = rpc.hash(height)?;
-    let header: Value = rpc.call("getblock", json!([hash, 1]))?;
-    ensure!(
-        header["hash"] == hash && header["height"] == height,
-        "receipt block identity mismatch"
-    );
-    let transactions = header["tx"]
-        .as_array()
-        .context("receipt block has no transaction list")?;
-    if !transactions
-        .iter()
-        .any(|id| id.as_str() == Some(locator.txid.as_str()))
-    {
+    if expected.is_some_and(|expected| expected != hash) {
         return Ok(None);
     }
-    let block = fetch_block(rpc, None, height, false)?;
+    let block = match (rpc.block(height), archive) {
+        (Err(error), Some((oss, from))) if height >= from && error.is::<RpcError>() => {
+            rpc.control.privacy(&format!(
+                "asked the OSS for block {height} in full: it may hold a payment to this wallet"
+            ));
+            oss.block(height, false)?
+        }
+        (result, _) => result?,
+    };
     // The subsequent contiguous sync validates the transitions from our
     // checkpoint. This lookup alone never makes a note spendable.
     ensure!(
         hash == block.hash && rpc.hash(height)? == block.hash,
         "receipt block changed during lookup; retry sync"
     );
-    Ok(contains_receipt(&block, receipt, locator)?.then_some(block))
+    Ok(contains_receipt(&block, receipt)?.then_some(block))
 }
 
 pub(super) fn locate(
     rpc: &Rpc,
+    archive: Archive,
     receipt: &Receipt,
     config: &Config,
     tip: u32,
@@ -223,38 +227,128 @@ pub(super) fn locate(
         return Ok(None);
     };
     if let Some(height) = locator.height
-        && let Some(block) = located_block(rpc, height, receipt, locator, config, tip)?
+        && let Some(block) = located_block(
+            rpc,
+            archive,
+            height,
+            locator.block_hash.as_deref(),
+            receipt,
+            config,
+            tip,
+        )?
     {
         return Ok(Some(block));
     }
     // A reorg can move the same transaction to another height. Ignore the
     // stale hint and resolve the txid against the node's current chain.
-    // privacy: tells the node which transaction paid this wallet.
-    let result: Value = match rpc.call("getrawtransaction", json!([locator.txid, 1])) {
-        Ok(result) => result,
-        Err(error) if error.downcast_ref::<RpcError>().is_some_and(|error| error.code == Some(-5)) => return Ok(None),
+    rpc.privacy("asked the node about the transaction that paid a received note");
+    let (height, hash) = match rpc.call::<Value>("getrawtransaction", json!([locator.txid, 1])) {
+        Ok(result) => {
+            // Mempool or side chain: no height or blockhash.
+            let (Some(hash), Some(height)) = (result["blockhash"].as_str(), result["height"].as_u64()) else {
+                return Ok(None);
+            };
+            let height = u32::try_from(height)?;
+            if height > tip || height < config.activation || rpc.hash(height)? != hash {
+                return Ok(None); // Newer than this sync snapshot, or reorganized.
+            }
+            (height, Some(hash.to_owned()))
+        }
+        // A pruned node forgets mined transactions; the OSS indexes them.
+        Err(error) if rpc::not_found(&error) => {
+            let (Some((oss, _)), Some(_)) = (archive, rpc.pruned_below()?) else {
+                return Ok(None);
+            };
+            rpc.control.privacy(
+                "asked the OSS where the transaction that paid a received note was mined: it can link this wallet to it",
+            );
+            match oss.transactions(std::slice::from_ref(&locator.txid))?[..] {
+                [Some(height)] => (height, None),
+                _ => return Ok(None),
+            }
+        }
         Err(error) => return Err(error.context("cannot locate receipt transaction; supply --txid/--height if the node lacks historical transaction lookup")),
     };
-    let Some(hash) = result["blockhash"].as_str() else {
-        return Ok(None);
-    };
-    bytes32(hash)?;
-    let header: Value = rpc.call("getblock", json!([hash, 1]))?;
-    let height = u32::try_from(
-        header["height"]
-            .as_u64()
-            .context("receipt block has no height")?,
-    )?;
-    if height > tip || height < config.activation || rpc.hash(height)? != hash {
-        return Ok(None); // Mempool, side-chain, or newer than this sync snapshot.
-    }
-    ensure!(header["hash"] == hash, "receipt block identity mismatch");
-    let block = located_block(rpc, height, receipt, locator, config, tip)?;
+    let block = located_block(rpc, archive, height, hash.as_deref(), receipt, config, tip)?;
     ensure!(
         block.is_some(),
         "receipt transaction does not contain the note commitment in its block; correct its locator"
     );
     Ok(block)
+}
+
+/// Records which of this wallet's pending sends are mined at or below `last`
+/// (design §4.3), by ID: sync no longer downloads every block's transaction
+/// list. Only sends that could be mined from `synced_from` on are asked
+/// about; an earlier sync found any mined below it.
+fn find_mined_sends(
+    store: &Store,
+    rpc: &Rpc,
+    archive: Archive,
+    synced_from: u32,
+    last: &Block,
+) -> Result<()> {
+    let mut txids = Vec::new();
+    for (txid, expiry, _) in store.pending_summaries()? {
+        if (expiry == 0 || expiry >= synced_from) && !store.has_transaction(&txid)? {
+            txids.push(txid);
+        }
+    }
+    if txids.is_empty() {
+        return Ok(());
+    }
+    let mined = |txid: &str, height: u32, hash: Option<&str>| -> Result<()> {
+        if height <= last.height
+            && let Some(block) = store.block(height)?
+            && hash.is_none_or(|hash| hash == block.hash)
+        {
+            store.put_transaction(txid, height)?;
+        }
+        Ok(())
+    };
+    let mut forgotten = Vec::new();
+    // Zakura answers at most 1000 calls per batch.
+    for chunk in txids.chunks(1000) {
+        // privacy: no warning: the node got these transactions from this wallet.
+        let answers = rpc.batch(
+            "getrawtransaction",
+            chunk.iter().map(|txid| json!([txid, 1])).collect(),
+        )?;
+        for (txid, answer) in chunk.iter().zip(answers) {
+            match answer {
+                Ok(tx) => {
+                    if let (Some(height), Some(hash)) =
+                        (tx["height"].as_u64(), tx["blockhash"].as_str())
+                    {
+                        mined(txid, u32::try_from(height)?, Some(hash))?;
+                    }
+                }
+                Err(error) if rpc::not_found(&error) => forgotten.push(txid.clone()),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    // "Not found" is ambiguous only if the node pruned heights this sync covers.
+    if forgotten.is_empty() {
+        return Ok(());
+    }
+    let (Some((oss, _)), Some(pruned)) = (archive, rpc.pruned_below()?) else {
+        return Ok(());
+    };
+    if pruned <= synced_from {
+        return Ok(());
+    }
+    rpc.control.privacy(&format!(
+        "asked the OSS where {} of this wallet's transactions were mined, because the node pruned them: it can link this wallet to them",
+        forgotten.len()
+    ));
+    // The OSS's word alone: the node no longer has the block's transactions.
+    for (txid, height) in forgotten.iter().zip(oss.transactions(&forgotten)?) {
+        if let Some(height) = height {
+            mined(txid, height, None)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn progress(height: u32, first: u32, stop: u32, tip: u32) -> String {
@@ -367,7 +461,7 @@ pub(crate) fn sync_with_cache(
     for mut receipt in store.unresolved_notes()? {
         control.check()?;
         receipt.check_owner(&SpendingKey::from(config.seed), &config.network_id)?;
-        if let Some(block) = locate(&rpc, &receipt, config, tip)? {
+        if let Some(block) = locate(&rpc, archive, &receipt, config, tip)? {
             needed_start = needed_start.min(epoch_start(block.height, config.activation)?);
             let locator = receipt
                 .locator
@@ -387,7 +481,7 @@ pub(crate) fn sync_with_cache(
         }
     }
     let backfill = needed_start < first;
-    let mut previous = if backfill {
+    let previous = if backfill {
         let block = checkpoint(&rpc, archive, needed_start, config.activation)?;
         store.put_block(&block)?;
         store.clear_funding_snapshot()?;
@@ -408,65 +502,111 @@ pub(crate) fn sync_with_cache(
             && (height - config.activation) / EPOCH_SIZE < current_epoch
     };
     let fetch_thin = |height| from_height.is_none() && thin(height);
-    // Blocks fetched a page ahead from the OSS.
-    let mut ahead = BTreeMap::new();
+    // Remote heights not stored yet, in pages of up to `MAX_BLOCKS` that never
+    // mix thin and full blocks.
+    let stored = store.block_heights(start.saturating_add(1), stop)?;
+    let mut pages: Vec<(u32, u32, bool)> = Vec::new();
+    if let Some((_, from)) = archive {
+        for height in start.saturating_add(1).max(from)..=stop {
+            if stored.contains(&height) {
+                continue;
+            }
+            let thin = fetch_thin(height);
+            match pages.last_mut() {
+                Some((first, last, page_thin))
+                    if *last + 1 == height
+                        && *page_thin == thin
+                        && height - *first < MAX_BLOCKS =>
+                {
+                    *last = height;
+                }
+                _ => pages.push((height, height, thin)),
+            }
+        }
+    }
     control.stage(format!(
         "Syncing heights {}–{stop} (node tip {tip})…",
         start.saturating_add(1).min(stop)
     ))?;
-    for height in start.saturating_add(1)..=stop {
-        control.stage(progress(height, start.saturating_add(1), stop, tip))?;
-        let block = if let Some(cached) = store.block(height)? {
-            if rpc.hash(height)? == cached.hash {
-                cached
+    let previous = std::thread::scope(|scope| -> Result<Option<Block>> {
+        // The next page is fetched while this thread validates and stores
+        // the one before (design §4.3).
+        let (sender, arrivals) = std::sync::mpsc::sync_channel(1);
+        if let Some((oss, _)) = archive
+            && !pages.is_empty()
+        {
+            let background = control.background();
+            let (rpc, oss) = (rpc.fork(&background)?, oss.fork(&background)?);
+            let pages = &pages;
+            scope.spawn(move || {
+                for &(first, last, thin) in pages {
+                    let page = fetch_page(cache, &rpc, &oss, first, last, thin);
+                    let failed = page.is_err();
+                    if sender.send(page).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+        }
+        let mut previous = previous;
+        let (mut ahead, mut received) = (BTreeMap::new(), 0);
+        for height in start.saturating_add(1)..=stop {
+            control.stage(progress(height, start.saturating_add(1), stop, tip))?;
+            let block = if let Some(cached) = store.block(height)? {
+                if rpc.hash(height)? == cached.hash {
+                    cached
+                } else {
+                    store.rewind(height - 1)?;
+                    reorg = true;
+                    cache
+                        .lock()
+                        .unwrap()
+                        .fetch(&rpc, archive, height, fetch_thin(height))?
+                }
+            } else if archive.is_some_and(|(_, from)| height >= from) {
+                while !ahead.contains_key(&height)
+                    && pages
+                        .get(received)
+                        .is_some_and(|&(first, ..)| first <= height)
+                {
+                    ahead.extend(arrivals.recv().context("the page fetcher stopped")??);
+                    received += 1;
+                }
+                match ahead.remove(&height) {
+                    Some(block) => block,
+                    // Unplanned: a reorg rewound blocks that were stored.
+                    None => {
+                        cache
+                            .lock()
+                            .unwrap()
+                            .fetch(&rpc, archive, height, fetch_thin(height))?
+                    }
+                }
             } else {
-                store.rewind(height - 1)?;
-                reorg = true;
                 cache
                     .lock()
                     .unwrap()
                     .fetch(&rpc, archive, height, fetch_thin(height))?
-            }
-        } else if let Some((oss, _)) = archive.filter(|(_, from)| height >= *from) {
-            if !ahead.contains_key(&height) {
-                // A page never mixes thin and full blocks.
-                let thin = fetch_thin(height);
-                let to = (height..=stop)
-                    .take(MAX_BLOCKS as usize)
-                    .take_while(|h| fetch_thin(*h) == thin)
-                    .last()
-                    .unwrap_or(height);
-                ahead = cache
-                    .lock()
-                    .unwrap()
-                    .fetch_range(&rpc, oss, height, to, thin)?;
-            }
-            ahead
-                .remove(&height)
-                .expect("fetch_range returns every height")
-        } else {
-            cache
-                .lock()
-                .unwrap()
-                .fetch(&rpc, archive, height, fetch_thin(height))?
-        };
-        // Keep a receipt's block in full. Its thin copy was fetched anyway: a
-        // gap in the requests would point the OSS at the note.
-        let block = match located.remove(&height) {
-            Some(full) if full.hash == block.hash => full,
-            _ => block,
-        };
-        control.stage(format!("Validating block {height}…"))?;
-        cache.lock().unwrap().validate(
-            &block,
-            previous.as_ref(),
-            config.activation,
-            thin(height),
-        )?;
-        control.check()?;
-        store.put_block(&block)?;
-        previous = Some(block);
-    }
+            };
+            // Keep a receipt's block in full. Its thin copy was fetched anyway: a
+            // gap in the requests would point the OSS at the note.
+            let block = match located.remove(&height) {
+                Some(full) if full.hash == block.hash => full,
+                _ => block,
+            };
+            control.stage(format!("Validating block {height}…"))?;
+            cache.lock().unwrap().validate(
+                &block,
+                previous.as_ref(),
+                config.activation,
+                thin(height),
+            )?;
+            control.check()?;
+            store.put_block(&block)?;
+            previous = Some(block);
+        }
+        Ok(previous)
+    })?;
     let last = previous.expect("sync has a checkpoint");
     if last.height == tip {
         control.stage("Validating transparent funding snapshot…")?;
@@ -476,6 +616,7 @@ pub(crate) fn sync_with_cache(
         rpc.hash(last.height)? == last.hash,
         "chain reorganized during sync; retry"
     );
+    find_mined_sends(store, &rpc, archive, start.saturating_add(1), &last)?;
     let lookup = |values: &[String]| thin_spends(store, &rpc, archive, config.activation, values);
     super::refresh_note_nullifiers(store, config, last.epoch, Some(&lookup))?;
     let unresolved = store.unresolved_notes()?.len();

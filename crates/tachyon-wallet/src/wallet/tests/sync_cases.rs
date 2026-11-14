@@ -364,7 +364,9 @@ fn locator_follows_stale_height_and_aggregate_stamp_but_rejects_wrong_commitment
     let config = store.config()?;
     let rpc = rpc(&config, &Control::new(true))?;
     assert_eq!(
-        sync::locate(&rpc, &receipt, &config, 10)?.unwrap().height,
+        sync::locate(&rpc, None, &receipt, &config, 10)?
+            .unwrap()
+            .height,
         10
     );
     let mut unrelated = Receipt::new(
@@ -374,13 +376,13 @@ fn locator_follows_stale_height_and_aggregate_stamp_but_rejects_wrong_commitment
     )?;
     unrelated.locator = receipt.locator.clone();
     assert!(
-        sync::locate(&rpc, &unrelated, &config, 10)
+        sync::locate(&rpc, None, &unrelated, &config, 10)
             .unwrap_err()
             .to_string()
             .contains("note commitment")
     );
     receipt.locator.as_mut().unwrap().txid = "cd".repeat(32);
-    assert!(sync::locate(&rpc, &receipt, &config, 10)?.is_none());
+    assert!(sync::locate(&rpc, None, &receipt, &config, 10)?.is_none());
     assert!(!downloaded(&node).contains(&9));
     Ok(())
 }
@@ -480,4 +482,40 @@ fn progress_uses_actual_batch_heights() {
         "Fetching block 15635 (batch heights 10009–20008; node tip 30000)…"
     );
     assert_eq!(sync::epoch_start(32_789, 8).unwrap(), 32_776);
+}
+
+#[test]
+fn sync_many_shares_oss_pages_between_wallets() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let (alice, bob) = (temp.path().join("alice"), temp.path().join("bob"));
+    init_wallet(&node, &alice)?;
+    init_wallet(&node, &bob)?;
+    advance(&node, 30)?;
+    let db = oss::testing::TempDb::new();
+    let (url, handle) = spawn_oss(&node, &db)?;
+    handle.wait_built(30)?;
+    let control = Control::new(true);
+    let oss = crate::rpc::Oss::new(&url, None, &control)?;
+    let cache = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::wallet::sync::SyncCache::default(),
+    ));
+    for dir in [&alice, &bob] {
+        let store = Store::open(dir, false)?;
+        let config = store.config()?;
+        let synced = crate::wallet::sync::sync_with_cache(
+            &store,
+            &config,
+            1000,
+            None,
+            &control,
+            &cache,
+            Some(&oss),
+        )?;
+        assert_eq!(synced["height"], 30);
+        store.commit()?;
+    }
+    // Heights 9 to 30 came from the OSS once, for Alice; Bob's from the cache.
+    assert_eq!(cache.lock().unwrap().stats().0, 22);
+    Ok(())
 }

@@ -507,6 +507,25 @@ impl Store {
             |row| row.get(0),
         )?)
     }
+    /// Records one of this wallet's transactions as mined at `height`. Only
+    /// the wallet's own transactions are recorded: sync no longer downloads
+    /// every block's transaction list.
+    pub fn put_transaction(&self, txid: &str, height: u32) -> Result<()> {
+        self.ensure_indexes()?;
+        self.conn.execute(
+            "INSERT INTO block_transactions VALUES(?, ?) ON CONFLICT DO NOTHING",
+            params![txid, height],
+        )?;
+        Ok(())
+    }
+    /// The heights in `start..=end` that have a stored block.
+    pub fn block_heights(&self, start: u32, end: u32) -> Result<BTreeSet<u32>> {
+        Ok(self
+            .conn
+            .prepare("SELECT height FROM blocks WHERE height BETWEEN ? AND ?")?
+            .query_map(params![start, end], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
     pub fn block_by_txid(&self, txid: &str) -> Result<Option<Block>> {
         self.ensure_indexes()?;
         let height: Option<u32> = self
@@ -907,9 +926,11 @@ impl Store {
                 params![block.height, block.epoch],
             )?;
             // A spend in this block is invisible here: drop the epoch's
-            // unspent rows, to check them again through the OSS.
+            // unspent rows, to check them again through the OSS. Later
+            // epochs' rows go too (left by a rewind): a note with a row for
+            // the current epoch is never checked again.
             self.conn.execute(
-                "DELETE FROM note_nullifiers WHERE epoch=? AND spent_height IS NULL",
+                "DELETE FROM note_nullifiers WHERE epoch>=? AND spent_height IS NULL",
                 [block.epoch],
             )?;
         } else if self.table_exists("thin_blocks")? {

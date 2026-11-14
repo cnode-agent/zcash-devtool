@@ -160,6 +160,21 @@ impl Control {
         }
     }
 
+    /// For work on another thread: shares cancellation and timing, but keeps
+    /// its progress off the terminal.
+    pub(crate) fn background(&self) -> Self {
+        Self {
+            cancellation: self.cancellation.clone(),
+            quiet: true,
+            progress: Arc::new(Mutex::new(Progress {
+                message: "Fetching ahead".into(),
+                started: Instant::now(),
+                last_report: Instant::now(),
+            })),
+            timing: self.timing.clone(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn cache_counts(&self, kind: &str) -> (u64, u64) {
         self.timing
