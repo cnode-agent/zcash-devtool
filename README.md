@@ -70,6 +70,16 @@ Exports include the transaction ID, plus its block height and hash when known to
 
 The OSS proves closed epochs, and the wallet verifies each proof. Without `--oss-url`, the first payment that needs a closed epoch proves that epoch's QR buckets and caches all of them in the wallet database. A cached bucket is reused only if it verifies and matches the synced chain's epoch entry anchors; otherwise it is rebuilt.
 
+## Disk space
+
+A payment caches each input note's spendability proof (about 512 KiB). Sync deletes the cached proof once the note's spend is mined; the space is reused by later proofs. Wallets synced by older binaries keep every spent note's proof until the next sync, or until `prune`:
+
+```sh
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" prune --compact
+```
+
+Stop every other process using the wallet first: `prune` refuses to run while another process holds the wallet. Without `--compact` it only deletes the spent notes' proofs, and the file keeps its size. `--compact` also writes a compacted copy next to the wallet (it needs free space for the remaining data only), checks it, and renames it over the original. It prints row counts and per-table sizes before and after; a second run changes nothing.
+
 ## License
 
 All code in this workspace is licensed under either of
