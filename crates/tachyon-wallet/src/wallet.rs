@@ -164,6 +164,14 @@ enum Operation {
     },
     /// List mined, pending, or expired transactions (receipts and keys are not printed).
     Transactions,
+    /// Offline: delete the cached spendability proofs of spent notes, which are
+    /// never read again. Stop every other process using this wallet first.
+    Prune {
+        /// Also rewrite the database into a compacted copy and rename it over
+        /// the original, returning the freed space (needs room for the copy).
+        #[arg(long)]
+        compact: bool,
+    },
 }
 
 impl Command {
@@ -272,6 +280,9 @@ impl Command {
             result["trusted_checkpoint"] = json!(start != activation_height);
             return Ok(result);
         }
+        if let Operation::Prune { compact } = self.command {
+            return crate::store::prune(&self.wallet_dir, compact, control);
+        }
         control.stage("Opening wallet database…")?;
         let read_only = matches!(
             self.command,
@@ -296,7 +307,7 @@ impl Command {
             .transpose()?;
         let oss = oss.as_ref();
         let result = match self.command {
-            Operation::Init { .. } => unreachable!("handled above"),
+            Operation::Init { .. } | Operation::Prune { .. } => unreachable!("handled above"),
             Operation::Address => addresses(&config)?,
             operation @ (Operation::Balance | Operation::BalanceSummary) => {
                 let summary = matches!(operation, Operation::BalanceSummary);

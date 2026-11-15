@@ -14,6 +14,21 @@ use std::{
 use udon::field::Field;
 use zcash_tachyon::{Anchor, EpochIndex, QrProfile, Tachygram, constants::EPOCH_SIZE, pasta::Fp};
 
+mod prune;
+pub use prune::prune;
+
+/// Cached lineages deleted per statement (each one is about 512 KiB).
+pub(crate) const PRUNE_BATCH: usize = 256;
+
+/// The cached `NoteSpendable` lineages of notes with a spent nullifier, which
+/// are never read again: a rewind that unspends a note discards every
+/// lineage. `DELETE … LIMIT` needs SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which
+/// the bundled SQLite lacks, hence the rowid subquery.
+pub(crate) const PRUNE_SPENT_PROOFS: &str = "DELETE FROM spendable_proofs WHERE rowid IN (
+    SELECT rowid FROM spendable_proofs WHERE note_id IN (
+        SELECT note_id FROM note_nullifiers WHERE spent_height IS NOT NULL)
+    LIMIT ?)";
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -271,6 +286,11 @@ impl Store {
         };
         let conn = Connection::open_with_flags(path, flags)?;
         conn.busy_timeout(Duration::from_secs(1))?;
+        if initialize {
+            // Only settable before the first table: lets `PRAGMA
+            // incremental_vacuum` return freed pages without a full VACUUM.
+            conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
+        }
         if read_only {
             conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         } else {
@@ -625,6 +645,23 @@ impl Store {
             params![note_id, pcd],
         )?;
         Ok(())
+    }
+    /// Deletes the cached lineages of spent notes, [`PRUNE_BATCH`] rows per
+    /// statement, calling `between` after each full batch. Creates no table.
+    pub fn prune_spent_proofs(&self, mut between: impl FnMut() -> Result<()>) -> Result<u64> {
+        if !(self.table_exists("spendable_proofs")? && self.table_exists("note_nullifiers")?) {
+            return Ok(0);
+        }
+        let mut statement = self.conn.prepare(PRUNE_SPENT_PROOFS)?;
+        let mut total = 0;
+        loop {
+            let deleted = statement.execute([PRUNE_BATCH])?;
+            total += u64::try_from(deleted)?;
+            if deleted < PRUNE_BATCH {
+                return Ok(total);
+            }
+            between()?;
+        }
     }
     pub fn clear_chain(&self) -> Result<()> {
         self.ensure_proof_tables()?;

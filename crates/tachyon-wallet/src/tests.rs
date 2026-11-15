@@ -842,6 +842,85 @@ fn cached_spendability(remote: bool) -> Result<()> {
     Ok(())
 }
 
+/// A spent note's cached lineage is pruned and an unspent one's is kept.
+/// A rewind that unspends the note discards every lineage, and `spendable`
+/// rebuilds one on the cache miss.
+#[test]
+fn pruned_lineage_of_a_spent_note_is_rebuilt_after_a_rewind() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    let store = crate::store::Store::open(directory.path(), true)?;
+    let config = crate::store::Config {
+        version: 1,
+        rpc_url: String::new(),
+        cookie_file: None,
+        activation: 8,
+        activation_hash: genesis().hash,
+        genesis: String::new(),
+        network_id: NETWORK.into(),
+        seed: SEED,
+        birthday_height: Some(8),
+    };
+    store.set_config(&config)?;
+    let mut blocks = vec![genesis()];
+    let (spent, kept) = (own(1_000_000), own(2_000_000));
+    for receipt in [&spent, &kept] {
+        let funded = shield(&blocks, receipt)?;
+        mine(&mut blocks, Some(&funded))?;
+        store.put_note(receipt)?;
+    }
+    for block in &blocks {
+        store.put_block(block)?;
+    }
+    crate::wallet::refresh_note_nullifiers(&store, &config, 0, None)?;
+    let chain = ChainData::Store(&store);
+    let prover = Prover::Local(&chain);
+    let (control, key) = (Control::new(true), SpendingKey::from(SEED));
+    for receipt in [&spent, &kept] {
+        crate::proofs::spendable(&chain, &prover, &key, receipt.note()?, &control)?;
+    }
+    let kept_lineage = store.spendable_proof(&kept.id()?)?;
+    assert!(kept_lineage.is_some());
+    assert!(store.spendable_proof(&spent.id()?)?.is_some());
+
+    let payment = build(Payment {
+        seed: SEED,
+        blocks: (&blocks).into(),
+        spends: vec![&spent],
+        funding: None,
+        outputs: &[own(950_000)],
+        transparent_output: None,
+        expiry: 40,
+    })?;
+    mine(&mut blocks, Some(&payment))?;
+    let spend_height = blocks.last().unwrap().height;
+    store.put_block(blocks.last().unwrap())?;
+    assert!(store.spent_note_ids()?.contains(&spent.id()?));
+    assert_eq!(store.prune_spent_proofs(|| Ok(()))?, 1);
+    assert_eq!(store.spendable_proof(&spent.id()?)?, None);
+    assert_eq!(store.spendable_proof(&kept.id()?)?, kept_lineage);
+    assert_eq!(store.prune_spent_proofs(|| Ok(()))?, 0);
+
+    store.rewind(spend_height - 1)?;
+    assert!(store.spent_note_ids()?.is_empty());
+    assert_eq!(store.spendable_proof(&kept.id()?)?, None);
+    let rebuilt = crate::proofs::spendable(&chain, &prover, &key, spent.note()?, &control)?;
+    assert!(oss_core::verify_pcd(&rebuilt)?);
+    assert_eq!(
+        Tachygram::from(rebuilt.data().0),
+        Tachygram::from(spent.note()?.commitment())
+    );
+    assert_eq!(u32::from(rebuilt.data().1), store.tip()?.unwrap().epoch);
+    assert!(store.spendable_proof(&spent.id()?)?.is_some());
+    // Still unspent: nothing to prune.
+    assert_eq!(store.prune_spent_proofs(|| Ok(()))?, 0);
+    Ok(())
+}
+
 fn spent_note_has_no_evidence(remote: bool) -> Result<()> {
     let mut blocks = vec![genesis()];
     let receipt = own(1_000_000);

@@ -16,6 +16,7 @@ use std::{
 use transparent::bundle::{Bundle, TxOut};
 use zcash_tachyon::TachyonBundle;
 
+mod prune_cases;
 mod sync_cases;
 
 struct NodeData {
