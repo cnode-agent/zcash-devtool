@@ -900,10 +900,10 @@ fn pruned_lineage_of_a_spent_note_is_rebuilt_after_a_rewind() -> Result<()> {
     let spend_height = blocks.last().unwrap().height;
     store.put_block(blocks.last().unwrap())?;
     assert!(store.spent_note_ids()?.contains(&spent.id()?));
-    assert_eq!(store.prune_spent_proofs(|| Ok(()))?, 1);
+    assert_eq!(store.prune_spent_proofs(None, || Ok(()))?, 1);
     assert_eq!(store.spendable_proof(&spent.id()?)?, None);
     assert_eq!(store.spendable_proof(&kept.id()?)?, kept_lineage);
-    assert_eq!(store.prune_spent_proofs(|| Ok(()))?, 0);
+    assert_eq!(store.prune_spent_proofs(None, || Ok(()))?, 0);
 
     store.rewind(spend_height - 1)?;
     assert!(store.spent_note_ids()?.is_empty());
@@ -917,7 +917,7 @@ fn pruned_lineage_of_a_spent_note_is_rebuilt_after_a_rewind() -> Result<()> {
     assert_eq!(u32::from(rebuilt.data().1), store.tip()?.unwrap().epoch);
     assert!(store.spendable_proof(&spent.id()?)?.is_some());
     // Still unspent: nothing to prune.
-    assert_eq!(store.prune_spent_proofs(|| Ok(()))?, 0);
+    assert_eq!(store.prune_spent_proofs(None, || Ok(()))?, 0);
     Ok(())
 }
 

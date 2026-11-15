@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::PRUNE_SPENT_PROOFS;
+use crate::store::{PRUNE_SPENT_PROOFS, PRUNE_SYNC_LIMIT};
 use rand::RngExt;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
@@ -8,7 +8,23 @@ use std::path::Path;
 const PROOF_BYTES: usize = 524_688;
 
 fn run_prune(dir: &Path, compact: bool) -> Result<Value> {
-    command(dir, Operation::Prune { compact })
+    command(
+        dir,
+        Operation::Prune {
+            compact,
+            sizes: false,
+        },
+    )
+}
+
+fn run_prune_sizes(dir: &Path, compact: bool) -> Result<Value> {
+    command(
+        dir,
+        Operation::Prune {
+            compact,
+            sizes: true,
+        },
+    )
 }
 
 fn lineage(dir: &Path, note: &str) -> Result<Option<Vec<u8>>> {
@@ -203,7 +219,7 @@ fn prune_deletes_only_spent_lineages_and_a_second_run_is_a_no_op() -> Result<()>
     }
     let summary = command(&dir, Operation::BalanceSummary)?;
 
-    let pruned = run_prune(&dir, false)?;
+    let pruned = run_prune_sizes(&dir, false)?;
     assert_eq!(pruned["rows_before"], 16, "{pruned}");
     assert_eq!(pruned["rows_deleted"], 15, "{pruned}");
     assert_eq!(pruned["rows_after"], 1, "{pruned}");
@@ -228,6 +244,75 @@ fn prune_deletes_only_spent_lineages_and_a_second_run_is_a_no_op() -> Result<()>
     assert_eq!(again["rows_after"], 1, "{again}");
     assert_eq!(file_digest(&dir)?, digest);
     assert_eq!(row_counts(&dir)?, expected);
+    Ok(())
+}
+
+#[test]
+fn prune_reports_table_sizes_only_with_sizes() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    backlog(&node, &dir, 4, 2, 1, 1024)?;
+    let pruned = run_prune(&dir, false)?;
+    assert_eq!(pruned["rows_deleted"], 2, "{pruned}");
+    assert_eq!(pruned["sizes"], false, "{pruned}");
+    assert_eq!(pruned["tables_before"], Value::Null, "{pruned}");
+    assert_eq!(pruned["tables_after"], Value::Null, "{pruned}");
+    for key in [
+        "rows_before",
+        "rows_after",
+        "bytes_before",
+        "bytes_after",
+        "free_bytes_before",
+        "free_bytes_after",
+    ] {
+        assert!(pruned[key].is_u64(), "{key}: {pruned}");
+    }
+    let sized = run_prune_sizes(&dir, false)?;
+    assert_eq!(sized["sizes"], true, "{sized}");
+    for key in ["tables_before", "tables_after"] {
+        for table in [
+            "blocks",
+            "notes",
+            "note_nullifiers",
+            "spendable_proofs",
+            "pending",
+            "operations",
+        ] {
+            assert!(
+                sized[key][table].as_u64().unwrap() > 0,
+                "{key}.{table}: {sized}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Each sync deletes at most [`PRUNE_SYNC_LIMIT`] lineages, so a backlog
+/// clears over several syncs; `prune` deletes it all in one command.
+#[test]
+fn sync_prunes_at_most_its_cap_while_prune_takes_every_row() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let (synced, pruned) = (temp.path().join("synced"), temp.path().join("pruned"));
+    let spent = 2 * PRUNE_SYNC_LIMIT + 52;
+    backlog(&node, &synced, spent + 1, spent, 1, 16)?;
+    copy_wallet(&synced, &pruned)?;
+    let proofs =
+        |dir| -> Result<usize> { Ok(usize::try_from(row_counts(dir)?["spendable_proofs"])?) };
+    let mut left = spent;
+    while left > 0 {
+        command(&synced, SYNC)?;
+        left -= left.min(PRUNE_SYNC_LIMIT);
+        assert_eq!(proofs(&synced)?, left + 1);
+    }
+    // Converged: the unspent note's lineage stays.
+    command(&synced, SYNC)?;
+    assert_eq!(proofs(&synced)?, 1);
+
+    let result = run_prune(&pruned, false)?;
+    assert_eq!(result["rows_deleted"], spent, "{result}");
+    assert_eq!(proofs(&pruned)?, 1);
     Ok(())
 }
 
@@ -409,7 +494,7 @@ fn prune_benchmark() -> Result<()> {
         let conn = database(&dir)?;
         let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {PRUNE_SPENT_PROOFS}"))?;
         let rows = plan
-            .query_map([256], |row| {
+            .query_map([crate::store::PRUNE_BATCH], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
@@ -446,15 +531,53 @@ fn prune_benchmark() -> Result<()> {
     );
     assert_eq!(synced["caught_up"], true);
 
-    // The first sync after an upgrade: the same backlog is discarded inside
-    // sync's own transaction.
+    // The first syncs after an upgrade: the same backlog is discarded inside
+    // sync's own transaction, at most PRUNE_SYNC_LIMIT rows per sync.
     let node = Node::start()?;
     let dir = temp.path().join("synced");
     backlog(&node, &dir, 2_000, 1_500, 0, PROOF_BYTES)?;
+    // One capped delete under sync's conditions (Store::open's BEGIN
+    // IMMEDIATE, rollback journal, synchronous=FULL), in both file formats:
+    // its journal holds the pages it changes, not the freed pages.
+    for legacy in [false, true] {
+        let copy = temp
+            .path()
+            .join(if legacy { "legacy" } else { "incremental" });
+        copy_wallet(&dir, &copy)?;
+        if legacy {
+            Connection::open(copy.join("tachyon.sqlite"))?
+                .execute_batch("PRAGMA auto_vacuum=NONE; VACUUM;")?;
+        }
+        let store = Store::open(&copy, false)?;
+        let started = std::time::Instant::now();
+        let deleted = store.prune_spent_proofs(Some(PRUNE_SYNC_LIMIT), || Ok(()))?;
+        let elapsed = started.elapsed();
+        let journal = std::fs::metadata(copy.join("tachyon.sqlite-journal"))?.len();
+        store.commit()?;
+        eprintln!(
+            "capped delete, auto_vacuum={}: {deleted} rows in {:.3}s, journal {journal} bytes",
+            if legacy { "NONE" } else { "INCREMENTAL" },
+            elapsed.as_secs_f64()
+        );
+        assert_eq!(deleted, PRUNE_SYNC_LIMIT as u64);
+        assert!(journal < 16 << 20, "journal {journal} bytes");
+    }
     let started = std::time::Instant::now();
     let synced = command(&dir, SYNC)?;
+    let first = started.elapsed();
     eprintln!(
         "first sync over the backlog ({:.2}s): {synced}",
+        first.as_secs_f64()
+    );
+    assert!(first < Duration::from_secs(30), "{first:?}");
+    assert_eq!(
+        row_counts(&dir)?["spendable_proofs"],
+        (1_500 - PRUNE_SYNC_LIMIT) as u64
+    );
+    let started = std::time::Instant::now();
+    command(&dir, SYNC)?;
+    eprintln!(
+        "second sync over the backlog: {:.2}s",
         started.elapsed().as_secs_f64()
     );
     assert_eq!(row_counts(&dir)?["spendable_proofs"], 0);

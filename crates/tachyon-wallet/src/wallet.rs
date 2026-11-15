@@ -171,6 +171,10 @@ enum Operation {
         /// the original, returning the freed space (needs room for the copy).
         #[arg(long)]
         compact: bool,
+        /// Also report each table's allocated bytes before and after. Reads
+        /// every page of the file: slow on a large wallet.
+        #[arg(long)]
+        sizes: bool,
     },
 }
 
@@ -280,8 +284,8 @@ impl Command {
             result["trusted_checkpoint"] = json!(start != activation_height);
             return Ok(result);
         }
-        if let Operation::Prune { compact } = self.command {
-            return crate::store::prune(&self.wallet_dir, compact, control);
+        if let Operation::Prune { compact, sizes } = self.command {
+            return crate::store::prune(&self.wallet_dir, compact, sizes, control);
         }
         control.stage("Opening wallet database…")?;
         let read_only = matches!(

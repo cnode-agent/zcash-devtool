@@ -18,15 +18,23 @@ mod prune;
 pub use prune::prune;
 
 /// Cached lineages deleted per statement (each one is about 512 KiB).
-pub(crate) const PRUNE_BATCH: usize = 256;
+pub(crate) const PRUNE_BATCH: usize = 1024;
+
+/// Most lineages one sync deletes, inside its single transaction. A larger
+/// backlog clears over the following syncs, or at once with `prune`.
+pub(crate) const PRUNE_SYNC_LIMIT: usize = 1024;
 
 /// The cached `NoteSpendable` lineages of notes with a spent nullifier, which
 /// are never read again: a rewind that unspends a note discards every
-/// lineage. `DELETE … LIMIT` needs SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which
-/// the bundled SQLite lacks, hence the rowid subquery.
+/// lineage. Driven by the cached proofs (a covering scan of their note_id
+/// index), each probing the nullifier primary key: the cost follows the
+/// cached proofs, not the nullifier history. `DELETE … LIMIT` needs
+/// SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which the bundled SQLite lacks, hence
+/// the rowid subquery.
 pub(crate) const PRUNE_SPENT_PROOFS: &str = "DELETE FROM spendable_proofs WHERE rowid IN (
-    SELECT rowid FROM spendable_proofs WHERE note_id IN (
-        SELECT note_id FROM note_nullifiers WHERE spent_height IS NOT NULL)
+    SELECT p.rowid FROM spendable_proofs p
+    WHERE EXISTS (SELECT 1 FROM note_nullifiers n
+                  WHERE n.note_id=p.note_id AND n.spent_height IS NOT NULL)
     LIMIT ?)";
 
 #[derive(Serialize, Deserialize)]
@@ -646,22 +654,32 @@ impl Store {
         )?;
         Ok(())
     }
-    /// Deletes the cached lineages of spent notes, [`PRUNE_BATCH`] rows per
-    /// statement, calling `between` after each full batch. Creates no table.
-    pub fn prune_spent_proofs(&self, mut between: impl FnMut() -> Result<()>) -> Result<u64> {
+    /// Deletes the cached lineages of spent notes, at most `limit` of them
+    /// (all with `None`), [`PRUNE_BATCH`] rows per statement, calling
+    /// `between` after each full batch short of the limit. Creates no table.
+    pub fn prune_spent_proofs(
+        &self,
+        limit: Option<usize>,
+        mut between: impl FnMut() -> Result<()>,
+    ) -> Result<u64> {
         if !(self.table_exists("spendable_proofs")? && self.table_exists("note_nullifiers")?) {
             return Ok(0);
         }
         let mut statement = self.conn.prepare(PRUNE_SPENT_PROOFS)?;
         let mut total = 0;
         loop {
-            let deleted = statement.execute([PRUNE_BATCH])?;
-            total += u64::try_from(deleted)?;
-            if deleted < PRUNE_BATCH {
-                return Ok(total);
+            let batch = limit.map_or(PRUNE_BATCH, |limit| PRUNE_BATCH.min(limit - total));
+            if batch == 0 {
+                break;
+            }
+            let deleted = statement.execute([batch])?;
+            total += deleted;
+            if deleted < batch || limit == Some(total) {
+                break;
             }
             between()?;
         }
+        Ok(u64::try_from(total)?)
     }
     pub fn clear_chain(&self) -> Result<()> {
         self.ensure_proof_tables()?;
@@ -1089,6 +1107,107 @@ mod tests {
             BTreeSet::from(["notes:legacy-note".to_string()])
         );
         assert!(store.reserved_sources(Some(11))?.is_empty());
+        Ok(())
+    }
+
+    fn private_store() -> Result<(tempfile::TempDir, Store)> {
+        let directory = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        let store = Store::open(directory.path(), true)?;
+        Ok((directory, store))
+    }
+
+    /// Notes `from..from + spent + kept`, the first `spent` spent, each with
+    /// a cached lineage.
+    fn lineages(store: &Store, from: usize, spent: usize, kept: usize) -> Result<()> {
+        for i in from..from + spent + kept {
+            let id = format!("{i:064x}");
+            let nullifier = format!("{:064x}", (i + 1) << 32);
+            store.put_note_nullifier(&id, 0, &nullifier, (i < from + spent).then_some(9))?;
+            store.put_spendable_proof(&id, &[1; 16])?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capped_prune_deletes_at_most_its_limit_and_converges() -> Result<()> {
+        let (_directory, store) = private_store()?;
+        let spent = 2 * PRUNE_BATCH + 300;
+        lineages(&store, 0, spent, 3)?;
+        let proofs = || -> Result<usize> {
+            Ok(store
+                .conn
+                .query_row("SELECT count(*) FROM spendable_proofs", [], |row| {
+                    row.get(0)
+                })?)
+        };
+        let unreachable = || -> Result<()> { unreachable!("no full batch below the limit") };
+        assert_eq!(store.prune_spent_proofs(Some(0), unreachable)?, 0);
+        assert_eq!(store.prune_spent_proofs(Some(100), unreachable)?, 100);
+        // Across a batch boundary: one full batch, then the rest of the limit.
+        let mut between = 0;
+        let limit = PRUNE_BATCH + 50;
+        let deleted = store.prune_spent_proofs(Some(limit), || {
+            between += 1;
+            Ok(())
+        })?;
+        assert_eq!((deleted, between), (limit as u64, 1));
+        let mut left = spent - 100 - limit;
+        assert_eq!(proofs()?, left + 3);
+        // As sync calls it: exactly the cap while more remain, then the rest.
+        while left > 0 {
+            let expected = left.min(PRUNE_SYNC_LIMIT);
+            let deleted = store.prune_spent_proofs(Some(PRUNE_SYNC_LIMIT), || Ok(()))?;
+            assert_eq!(deleted, expected as u64);
+            left -= expected;
+            assert_eq!(proofs()?, left + 3);
+        }
+        assert_eq!(
+            store.prune_spent_proofs(Some(PRUNE_SYNC_LIMIT), || Ok(()))?,
+            0
+        );
+        assert_eq!(proofs()?, 3);
+
+        // Without a limit, as prune calls it: every row, between full batches.
+        lineages(&store, spent + 3, spent, 3)?;
+        let mut between = 0;
+        let deleted = store.prune_spent_proofs(None, || {
+            between += 1;
+            Ok(())
+        })?;
+        assert_eq!((deleted, between), (spent as u64, spent / PRUNE_BATCH));
+        assert_eq!(proofs()?, 6);
+        Ok(())
+    }
+
+    /// The delete follows the cached proofs and probes each one's nullifiers
+    /// by note: it never scans the nullifier history.
+    #[test]
+    fn prune_plan_probes_nullifiers_by_note() -> Result<()> {
+        let (_directory, store) = private_store()?;
+        lineages(&store, 0, 20, 20)?;
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {PRUNE_SPENT_PROOFS}"))?
+            .query_map([PRUNE_BATCH], |row| row.get(3))?
+            .collect::<rusqlite::Result<_>>()?;
+        // `n` from SQLite 3.36, `note_nullifiers AS n` before it.
+        let nullifiers = |detail: &&String| {
+            detail
+                .split_whitespace()
+                .any(|word| word == "n" || word == "note_nullifiers")
+        };
+        assert!(
+            plan.iter()
+                .filter(nullifiers)
+                .all(|detail| detail.starts_with("SEARCH") && detail.contains("(note_id=?)")),
+            "{plan:?}"
+        );
+        assert!(plan.iter().any(|detail| nullifiers(&detail)), "{plan:?}");
         Ok(())
     }
 }

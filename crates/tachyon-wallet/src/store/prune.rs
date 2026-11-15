@@ -22,8 +22,9 @@ const COMPACTING: &str = "tachyon.sqlite.compact";
 const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Deletes every cached lineage of a spent note, one batch per transaction,
-/// and with `compact` replaces the database with a compacted copy.
-pub fn prune(dir: &Path, compact: bool, control: &Control) -> Result<Value> {
+/// and with `compact` replaces the database with a compacted copy. `sizes`
+/// adds each table's allocated bytes, which reads the whole file (dbstat).
+pub fn prune(dir: &Path, compact: bool, sizes: bool, control: &Control) -> Result<Value> {
     let started = Instant::now();
     let path = dir.join(DATABASE);
     control.stage("Opening wallet database…")?;
@@ -40,17 +41,22 @@ pub fn prune(dir: &Path, compact: bool, control: &Control) -> Result<Value> {
         let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
         ensure!(busy == 0, "{}", HELD);
     }
+    // Only the batches below: the journal still rolls back a batch a crash
+    // interrupts, and the rows are a cache that a re-run deletes again. Not
+    // settable inside a transaction; restored before compaction or return.
+    conn.execute_batch("PRAGMA synchronous=NORMAL")?;
     // Rollback mode: EXCLUSIVE fails while any other connection reads or writes.
     conn.execute_batch("BEGIN EXCLUSIVE").map_err(locked)?;
     control.stage("Measuring wallet database…")?;
-    let before = Usage::measure(&store, &path)?;
+    let before = Usage::measure(&store, &path, sizes)?;
     control.stage("Discarding cached proofs of spent notes…")?;
-    let deleted = store.prune_spent_proofs(|| {
+    let deleted = store.prune_spent_proofs(None, || {
         control.check()?;
         conn.execute_batch("COMMIT; BEGIN EXCLUSIVE")
             .map_err(locked)
     })?;
     store.commit()?;
+    conn.execute_batch("PRAGMA synchronous=FULL")?;
     let free_pages: u64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
     let quick_check = if compact && (free_pages > 0 || wal) {
         control.stage("Compacting wallet database…")?;
@@ -60,8 +66,9 @@ pub fn prune(dir: &Path, compact: bool, control: &Control) -> Result<Value> {
         None
     };
     let check = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let after = Usage::measure_connection(&check, &path)?;
+    let after = Usage::measure_connection(&check, &path, sizes)?;
     Ok(json!({
+        "sizes": before.tables.is_some() && after.tables.is_some(),
         "rows_before": before.rows,
         "rows_deleted": deleted,
         "rows_after": after.rows,
@@ -252,16 +259,17 @@ struct Usage {
     rows: u64,
     bytes: u64,
     free_bytes: u64,
-    /// Allocated bytes per table, its indexes included, where SQLite has dbstat.
+    /// Allocated bytes per table, its indexes included, when asked for and
+    /// SQLite has dbstat. O(file size): every page is read.
     tables: Option<BTreeMap<String, u64>>,
 }
 
 impl Usage {
-    fn measure(store: &Store, path: &Path) -> Result<Self> {
-        Self::measure_connection(&store.conn, path)
+    fn measure(store: &Store, path: &Path, sizes: bool) -> Result<Self> {
+        Self::measure_connection(&store.conn, path, sizes)
     }
 
-    fn measure_connection(conn: &Connection, path: &Path) -> Result<Self> {
+    fn measure_connection(conn: &Connection, path: &Path, sizes: bool) -> Result<Self> {
         let has_proofs: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='spendable_proofs')",
             [],
@@ -282,7 +290,7 @@ impl Usage {
             rows,
             bytes,
             free_bytes: free_pages * page_size,
-            tables: table_bytes(conn)?,
+            tables: if sizes { table_bytes(conn)? } else { None },
         })
     }
 }

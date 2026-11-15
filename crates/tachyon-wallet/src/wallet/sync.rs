@@ -620,9 +620,10 @@ pub(crate) fn sync_with_cache(
     let lookup = |values: &[String]| thin_spends(store, &rpc, archive, config.activation, values);
     super::refresh_note_nullifiers(store, config, last.epoch, Some(&lookup))?;
     // After every way a spend is recorded: in a block's index, or above for
-    // a new epoch's row or a thin epoch's OSS answer. In this transaction.
+    // a new epoch's row or a thin epoch's OSS answer. In this transaction,
+    // so bounded: a larger backlog continues at the next sync.
     control.stage("Discarding cached proofs of spent notes…")?;
-    store.prune_spent_proofs(|| control.check())?;
+    store.prune_spent_proofs(Some(crate::store::PRUNE_SYNC_LIMIT), || control.check())?;
     let unresolved = store.unresolved_notes()?.len();
     Ok(
         json!({"height":last.height,"hash":last.hash,"epoch":last.epoch,"caught_up":last.height == tip,

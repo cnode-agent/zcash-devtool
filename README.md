@@ -72,13 +72,13 @@ The OSS proves closed epochs, and the wallet verifies each proof. Without `--oss
 
 ## Disk space
 
-A payment caches each input note's spendability proof (about 512 KiB). Sync deletes the cached proof once the note's spend is mined; the space is reused by later proofs. Wallets synced by older binaries keep every spent note's proof until the next sync, or until `prune`:
+A payment caches each input note's spendability proof (about 512 KiB). Sync deletes the cached proof once the note's spend is mined, at most 1024 per sync; the space is reused by later proofs. Wallets synced by older binaries keep every spent note's proof until later syncs work through them, or until `prune`:
 
 ```sh
 "$DEVTOOL" tachyon --wallet-dir "$WALLET" prune --compact
 ```
 
-Stop every other process using the wallet first: `prune` refuses to run while another process holds the wallet. Without `--compact` it only deletes the spent notes' proofs, and the file keeps its size. `--compact` also writes a compacted copy next to the wallet (it needs free space for the remaining data only), checks it, and renames it over the original. It prints row counts and per-table sizes before and after; a second run changes nothing.
+Stop every other process using the wallet first: `prune` refuses to run while another process holds the wallet. Without `--compact` it only deletes the spent notes' proofs, and the file keeps its size. `--compact` also writes a compacted copy next to the wallet (it needs free space for the remaining data only), checks it, and renames it over the original. It prints the cached proofs' row counts, file bytes and free bytes before and after; add `--sizes` for each table's size too, which reads the whole file and is slow on a large wallet. A second run changes nothing.
 
 ## License
 
