@@ -302,8 +302,14 @@ impl Store {
         if read_only {
             conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         } else {
+            // This wallet deletes only public or derived data (blocks,
+            // tachygrams, cached proofs) and never keys, notes or pending
+            // transactions. Secure deletion zeroes every freed page and writes
+            // it to the rollback journal, so pruning a capped batch of 1024
+            // proofs (512 MiB) cost ~10s and a 540 MiB journal; without it the
+            // same delete is metadata only.
             conn.execute_batch(
-                "PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;",
+                "PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=OFF; BEGIN IMMEDIATE;",
             )?;
         }
         if initialize {
@@ -1208,6 +1214,18 @@ mod tests {
             "{plan:?}"
         );
         assert!(plan.iter().any(|detail| nullifiers(&detail)), "{plan:?}");
+        Ok(())
+    }
+
+    /// Pruning must not zero and journal every freed proof page: secure
+    /// deletion made a capped batch of 1024 proofs ~10s with a 540 MiB journal.
+    #[test]
+    fn write_connections_do_not_zero_deleted_pages() -> Result<()> {
+        let (_directory, store) = private_store()?;
+        let secure_delete: i64 = store
+            .conn
+            .query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
+        assert_eq!(secure_delete, 0);
         Ok(())
     }
 }
