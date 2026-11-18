@@ -316,7 +316,6 @@ impl Command {
             return Ok(json!({
                 "blocks_thinned": stats.blocks,
                 "members_dropped": stats.members,
-                "json_bytes_freed": stats.json_bytes,
                 "vacuumed": !no_vacuum,
             }));
         }

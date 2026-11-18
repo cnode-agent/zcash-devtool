@@ -211,7 +211,7 @@ fn prune_deletes_only_spent_lineages_and_a_second_run_is_a_no_op() -> Result<()>
         "blocks",
         "notes",
         "note_nullifiers",
-        "tachygrams",
+        "chain_members",
         "pending",
         "operations",
     ] {

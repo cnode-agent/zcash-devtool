@@ -698,6 +698,7 @@ fn store_indexes_new_blocks_and_rewinds_without_rescanning() -> Result<()> {
     assert!(store.has_transaction(&funded.txid().to_string())?);
     assert_eq!(store.blocks_range(8, 8)?.len(), 1);
     store.put_note(&receipt)?;
+    store.resolve_notes()?;
     assert!(store.unresolved_notes()?.is_empty());
     let unconfirmed = own(2_000_000);
     store.put_note(&unconfirmed)?;
