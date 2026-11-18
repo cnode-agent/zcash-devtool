@@ -7426,6 +7426,7 @@ dependencies = [
  "zakura-udon",
  "zcash_script",
  "zcash_tachyon",
+ "zstd",
 ]
 
 [[package]]

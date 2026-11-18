@@ -1,11 +1,11 @@
 //! One SQLite writer lock covers selection and durable reservation of inputs.
 
-use crate::{chain::Block, funding_balance::Snapshot, note::Receipt};
+use crate::{chain::{Block, TachyonStamp}, funding_balance::Snapshot, note::Receipt};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -16,6 +16,35 @@ use zcash_tachyon::{Anchor, EpochIndex, QrProfile, Tachygram, constants::EPOCH_S
 
 mod prune;
 pub use prune::prune;
+
+/// zstd frame magic; older wallets still hold plain JSON receipt rows.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+fn encode_note(receipt: &Receipt) -> Result<Vec<u8>> {
+    Ok(zstd::stream::encode_all(
+        serde_json::to_vec(receipt)?.as_slice(),
+        3,
+    )?)
+}
+
+fn decode_note_json(bytes: &[u8]) -> Result<String> {
+    if bytes.starts_with(&ZSTD_MAGIC) {
+        Ok(String::from_utf8(zstd::stream::decode_all(bytes)?)?)
+    } else {
+        Ok(std::str::from_utf8(bytes)?.to_owned())
+    }
+}
+
+fn decode_note(bytes: &[u8]) -> Result<Receipt> {
+    Ok(serde_json::from_str(&decode_note_json(bytes)?)?)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompactStats {
+    pub blocks: u64,
+    pub members: u64,
+    pub pending: u64,
+}
 
 /// Cached lineages deleted per statement (each one is about 512 KiB).
 pub(crate) const PRUNE_BATCH: usize = 1024;
@@ -70,6 +99,7 @@ pub struct StoredOperation {
 
 pub struct Store {
     conn: Connection,
+    read_only: bool,
 }
 
 /// Chain evidence access for proofs: tests may use an in-memory slice, while
@@ -162,10 +192,18 @@ impl ChainData<'_> {
         let id = hex::encode(Fp::from(cm).to_bytes());
         let blocks: Vec<Block> = match self {
             Self::Blocks(blocks) => blocks.to_vec(),
-            Self::Store(store) => match store.tachygram_height(&id)? {
-                Some(height) => store.block(height)?.into_iter().collect(),
-                None => Vec::new(),
-            },
+            Self::Store(store) => {
+                // The compact per-note index survives chain compaction; the
+                // tachygram index is the fallback while the block is still full.
+                let height = match store.note_height(&id)? {
+                    Some(height) => Some(height),
+                    None => store.tachygram_height(&id)?,
+                };
+                match height {
+                    Some(height) => store.block(height)?.into_iter().collect(),
+                    None => Vec::new(),
+                }
+            }
         };
         for block in blocks {
             let mut cursor = block.entry()?;
@@ -188,7 +226,12 @@ impl ChainData<'_> {
                 .iter()
                 .flat_map(|block| &block.stamps)
                 .any(|stamp| stamp.tachygrams.contains(&id))),
-            Self::Store(store) => Ok(store.tachygram_height(&id)?.is_some()),
+            Self::Store(store) => Ok(store.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM note_nullifiers
+                               WHERE nullifier=? AND spent_height IS NOT NULL)",
+                [hex::decode(&id)?],
+                |row| row.get(0),
+            )?),
         }
     }
 
@@ -315,12 +358,17 @@ impl Store {
         if initialize {
             conn.execute_batch(
                 "CREATE TABLE config (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
-                CREATE TABLE blocks (height INTEGER PRIMARY KEY, data TEXT NOT NULL);
+                CREATE TABLE blocks (
+                    height INTEGER PRIMARY KEY, hash BLOB NOT NULL, prev BLOB NOT NULL,
+                    activation_height INTEGER NOT NULL, pool_height INTEGER NOT NULL,
+                    epoch INTEGER NOT NULL, epoch_length INTEGER NOT NULL,
+                    anchor_before BLOB NOT NULL, epoch_start_anchor BLOB,
+                    anchor_after BLOB NOT NULL);
                 CREATE TABLE notes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE pending (txid TEXT PRIMARY KEY, data TEXT NOT NULL);",
             )?;
         }
-        let store = Self { conn };
+        let store = Self { conn, read_only };
         if !read_only {
             store.ensure_pending_meta()?;
         }
@@ -409,7 +457,8 @@ impl Store {
         Ok(())
     }
     pub fn blocks(&self) -> Result<Vec<Block>> {
-        let mut blocks: Vec<Block> = self.read_all("SELECT data FROM blocks ORDER BY height")?;
+        self.ensure_indexes()?;
+        let mut blocks = self.read_headers(None)?;
         // Backfills retain the already downloaded suffix. Until the gap closes,
         // only the contiguous prefix is usable by balance/proof construction.
         if let Some(gap) = blocks.windows(2).position(|pair| {
@@ -421,6 +470,60 @@ impl Store {
         }
         Ok(blocks)
     }
+    /// Headers and stamps (without members) for all blocks or one range.
+    fn read_headers(&self, range: Option<(u32, u32)>) -> Result<Vec<Block>> {
+        let (start, end) = range.unwrap_or((0, u32::MAX));
+        let mut blocks: Vec<Block> = self
+            .conn
+            .prepare(
+                "SELECT height, hash, prev, activation_height, pool_height, epoch,
+                        epoch_length, anchor_before, epoch_start_anchor, anchor_after
+                 FROM blocks WHERE height BETWEEN ? AND ? ORDER BY height",
+            )?
+            .query_map(params![start, end], |row| {
+                let height: u32 = row.get(0)?;
+                let epoch_start: Option<Vec<u8>> = row.get(8)?;
+                Ok(Block {
+                    hash: hex::encode(row.get::<_, Vec<u8>>(1)?),
+                    previous_block_hash: hex::encode(row.get::<_, Vec<u8>>(2)?),
+                    height,
+                    activation_height: row.get(3)?,
+                    pool_height: row.get(4)?,
+                    epoch: row.get(5)?,
+                    epoch_length: row.get(6)?,
+                    anchor_before: hex::encode(row.get::<_, Vec<u8>>(7)?),
+                    epoch_start_anchor: epoch_start.map(hex::encode),
+                    anchor_after: hex::encode(row.get::<_, Vec<u8>>(9)?),
+                    stamps: Vec::new(),
+                    transactions: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut stamps: BTreeMap<u32, Vec<TachyonStamp>> = BTreeMap::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT height, transaction_index, txid, tachygram_set FROM chain_stamps
+                 WHERE height BETWEEN ? AND ? ORDER BY height, idx",
+            )?;
+            let mut rows = statement.query(params![start, end])?;
+            while let Some(row) = rows.next()? {
+                let height: u32 = row.get(0)?;
+                stamps.entry(height).or_default().push(TachyonStamp {
+                    transaction_index: row.get::<_, u32>(1)? as usize,
+                    txid: hex::encode(row.get::<_, Vec<u8>>(2)?),
+                    tachygram_set: hex::encode(row.get::<_, Vec<u8>>(3)?),
+                    tachygrams: Vec::new(),
+                });
+            }
+        }
+        for block in &mut blocks {
+            if let Some(found) = stamps.remove(&block.height) {
+                block.stamps = found;
+            }
+        }
+        self.attach_members(&mut blocks)?;
+        Ok(blocks)
+    }
     pub fn first_height(&self) -> Result<Option<u32>> {
         self.conn
             .query_row("SELECT MIN(height) FROM blocks", [], |row| row.get(0))
@@ -429,10 +532,12 @@ impl Store {
             .map_err(Into::into)
     }
     pub fn tip(&self) -> Result<Option<Block>> {
+        self.ensure_indexes()?;
         // Backfills may leave a cached suffix above a gap. Only the contiguous
         // prefix is usable as wallet evidence; walking heights in SQL avoids
         // deserializing that suffix or the whole chain.
-        self.conn
+        let height: Option<u32> = self
+            .conn
             .query_row(
                 "WITH RECURSIVE contiguous(height) AS (
                     SELECT MIN(height) FROM blocks
@@ -440,28 +545,35 @@ impl Store {
                     SELECT contiguous.height + 1 FROM contiguous
                     JOIN blocks ON blocks.height = contiguous.height + 1
                  )
-                 SELECT data FROM blocks WHERE height = (SELECT MAX(height) FROM contiguous)",
+                 SELECT MAX(height) FROM contiguous",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| row.get::<_, Option<u32>>(0),
             )
             .optional()?
-            .map(|data| Ok(serde_json::from_str(&data)?))
-            .transpose()
+            .flatten();
+        height.map(|height| self.block(height)).transpose().map(Option::flatten)
     }
     pub fn blocks_range(&self, start: u32, end: u32) -> Result<Vec<Block>> {
-        self.conn
-            .prepare("SELECT data FROM blocks WHERE height BETWEEN ? AND ? ORDER BY height")?
-            .query_map(params![start, end], |row| row.get::<_, String>(0))?
-            .map(|row| Ok(serde_json::from_str(&row?)?))
-            .collect()
+        self.ensure_indexes()?;
+        self.read_headers(Some((start, end)))
     }
     fn index_block(&self, block: &Block) -> Result<()> {
-        for stamp in &block.stamps {
+        let mut note_height = self.conn.prepare_cached(
+            "INSERT OR IGNORE INTO note_heights SELECT id, ?2 FROM notes WHERE id = ?1",
+        )?;
+        let mut note_stamp = self.conn.prepare_cached(
+            "INSERT OR IGNORE INTO chain_note_stamps
+             SELECT ?1, ?2, ?3 WHERE EXISTS(SELECT 1 FROM notes WHERE id = ?1)",
+        )?;
+        let mut spent = self.conn.prepare_cached(
+            "UPDATE note_nullifiers SET spent_height=?
+             WHERE spent_height IS NULL AND nullifier=?",
+        )?;
+        for (index, stamp) in block.stamps.iter().enumerate() {
             for member in &stamp.tachygrams {
-                self.conn.execute(
-                    "INSERT INTO tachygrams VALUES(?, ?) ON CONFLICT DO NOTHING",
-                    params![member, block.height],
-                )?;
+                note_height.execute(params![member, block.height])?;
+                note_stamp.execute(params![member, block.height, index as u32])?;
+                spent.execute(params![block.height, hex::decode(member)?])?;
             }
         }
         for txid in &block.transactions {
@@ -470,12 +582,6 @@ impl Store {
                 params![txid, block.height],
             )?;
         }
-        self.conn.execute(
-            "UPDATE note_nullifiers SET spent_height=?
-             WHERE spent_height IS NULL
-             AND nullifier IN (SELECT id FROM tachygrams WHERE height=?)",
-            params![block.height, block.height],
-        )?;
         Ok(())
     }
     /// Additive, one-time index migration for existing wallets. Steady-state
@@ -483,29 +589,324 @@ impl Store {
     fn ensure_indexes(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS tachygrams (id TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(id, height));
-             CREATE INDEX IF NOT EXISTS tachygrams_by_height ON tachygrams(height);
              CREATE TABLE IF NOT EXISTS block_transactions (txid TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(txid, height));
              CREATE INDEX IF NOT EXISTS transactions_by_height ON block_transactions(height);
              CREATE TABLE IF NOT EXISTS note_nullifiers (
-                note_id TEXT NOT NULL, epoch INTEGER NOT NULL, nullifier TEXT NOT NULL UNIQUE,
+                note_id TEXT NOT NULL, epoch INTEGER NOT NULL, nullifier BLOB NOT NULL UNIQUE,
                 spent_height INTEGER, PRIMARY KEY(note_id, epoch));
-             CREATE INDEX IF NOT EXISTS note_nullifiers_by_spend ON note_nullifiers(spent_height);",
+             CREATE INDEX IF NOT EXISTS note_nullifiers_by_spend ON note_nullifiers(spent_height);
+             CREATE TABLE IF NOT EXISTS note_heights (id TEXT PRIMARY KEY, height INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS note_heights_by_height ON note_heights(height);
+             CREATE TABLE IF NOT EXISTS chain_members (
+                height INTEGER NOT NULL, stamp INTEGER NOT NULL, idx INTEGER NOT NULL,
+                value BLOB NOT NULL, PRIMARY KEY(height, stamp, idx)) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS chain_note_stamps (
+                note_id TEXT PRIMARY KEY, height INTEGER NOT NULL, stamp INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS note_absent (id TEXT PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS chain_blocks (
+                height INTEGER PRIMARY KEY, hash BLOB NOT NULL, prev BLOB NOT NULL,
+                activation_height INTEGER NOT NULL, pool_height INTEGER NOT NULL,
+                epoch INTEGER NOT NULL, epoch_length INTEGER NOT NULL,
+                anchor_before BLOB NOT NULL, epoch_start_anchor BLOB,
+                anchor_after BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS chain_stamps (
+                height INTEGER NOT NULL, idx INTEGER NOT NULL,
+                transaction_index INTEGER NOT NULL, txid BLOB NOT NULL,
+                tachygram_set BLOB NOT NULL, PRIMARY KEY(height, idx)) WITHOUT ROWID;",
         )?;
-        let version: Option<String> = self
+        // Wallets written before the compact member store keep their stamp
+        // members in `blocks.data` and the `tachygrams` index: move them once.
+        if self.table_exists("tachygrams")? {
+            self.migrate_chain_members()?;
+        }
+        if self.table_exists("blocks")? && self.table_has_column("blocks", "data")? {
+            self.migrate_block_columns()?;
+        }
+        self.migrate_nullifier_blobs()?;
+        self.migrate_notes_compression()?;
+        // Read-only opens must not write: only stamp missing flags.
+        for flag in ["chain_index_v1", "note_heights_v1"] {
+            let present: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key=?",
+                    [flag],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if present.is_none() {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO metadata VALUES(?, '1')",
+                    [flag],
+                )?;
+            }
+        }
+        Ok(())
+    }
+    /// Moves stamp members out of the JSON blocks and the text index into
+    /// `chain_members` as 32-byte blobs, then drops the old index table.
+    fn migrate_chain_members(&self) -> Result<()> {
+        let notes: HashSet<String> = self
+            .conn
+            .prepare("SELECT id FROM notes")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut updates = Vec::new();
+        if self.table_exists("blocks")? {
+            let mut select = self
+                .conn
+                .prepare("SELECT height, data FROM blocks ORDER BY height")?;
+            let mut rows = select.query([])?;
+            while let Some(row) = rows.next()? {
+                let height: u32 = row.get(0)?;
+                let data: String = row.get(1)?;
+                let block: Block = serde_json::from_str(&data)?;
+                if !block.stamps.iter().any(|stamp| !stamp.tachygrams.is_empty()) {
+                    continue;
+                }
+                for (index, stamp) in block.stamps.iter().enumerate() {
+                    for (position, member) in stamp.tachygrams.iter().enumerate() {
+                        self.conn.execute(
+                            "INSERT OR IGNORE INTO chain_members VALUES(?, ?, ?, ?)",
+                            params![height, index as u32, position as u32, hex::decode(member)?],
+                        )?;
+                        if notes.contains(member) {
+                            self.conn.execute(
+                                "INSERT OR IGNORE INTO note_heights VALUES(?, ?)",
+                                params![member, height],
+                            )?;
+                            self.conn.execute(
+                                "INSERT OR IGNORE INTO chain_note_stamps VALUES(?, ?, ?)",
+                                params![member, height, index as u32],
+                            )?;
+                        }
+                    }
+                }
+                updates.push((height, Self::stripped(&block)?));
+            }
+        }
+        for (height, data) in updates {
+            self.conn.execute(
+                "UPDATE blocks SET data=? WHERE height=?",
+                params![data, height],
+            )?;
+        }
+        self.conn.execute("DROP TABLE tachygrams", [])?;
+        Ok(())
+    }
+    fn table_has_column(&self, table: &str, column: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|name| name.ok())
+            .any(|name| name == column))
+    }
+    /// Replaces the JSON block rows with typed header/stamp columns.
+    fn migrate_block_columns(&self) -> Result<()> {
+        let mut select = self
+            .conn
+            .prepare("SELECT height, data FROM blocks ORDER BY height")?;
+        let mut rows = select.query([])?;
+        let mut blocks = Vec::new();
+        while let Some(row) = rows.next()? {
+            let height: u32 = row.get(0)?;
+            let data: String = row.get(1)?;
+            let block: Block = serde_json::from_str(&data)?;
+            blocks.push((height, block));
+        }
+        drop(rows);
+        drop(select);
+        self.conn
+            .execute_batch("CREATE TABLE IF NOT EXISTS chain_blocks (height INTEGER PRIMARY KEY, hash BLOB NOT NULL, prev BLOB NOT NULL, activation_height INTEGER NOT NULL, pool_height INTEGER NOT NULL, epoch INTEGER NOT NULL, epoch_length INTEGER NOT NULL, anchor_before BLOB NOT NULL, epoch_start_anchor BLOB, anchor_after BLOB NOT NULL);")?;
+        for (height, block) in &blocks {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO chain_blocks VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    height,
+                    hex::decode(&block.hash)?,
+                    hex::decode(&block.previous_block_hash)?,
+                    block.activation_height,
+                    block.pool_height,
+                    block.epoch,
+                    block.epoch_length,
+                    hex::decode(&block.anchor_before)?,
+                    block
+                        .epoch_start_anchor
+                        .as_deref()
+                        .map(hex::decode)
+                        .transpose()?,
+                    hex::decode(&block.anchor_after)?
+                ],
+            )?;
+            self.conn
+                .execute("DELETE FROM chain_stamps WHERE height=?", [height])?;
+            for (index, stamp) in block.stamps.iter().enumerate() {
+                self.conn.execute(
+                    "INSERT INTO chain_stamps VALUES(?, ?, ?, ?, ?)",
+                    params![
+                        height,
+                        index as u32,
+                        stamp.transaction_index as u32,
+                        hex::decode(&stamp.txid)?,
+                        hex::decode(&stamp.tachygram_set)?
+                    ],
+                )?;
+            }
+        }
+        self.conn.execute_batch(
+            "DROP TABLE blocks; ALTER TABLE chain_blocks RENAME TO blocks;",
+        )?;
+        Ok(())
+    }
+    /// Compresses receipt JSON once; rows stay readable by their frame magic.
+    fn migrate_notes_compression(&self) -> Result<()> {
+        let done: Option<String> = self
             .conn
             .query_row(
-                "SELECT value FROM metadata WHERE key='chain_index_v1'",
+                "SELECT value FROM metadata WHERE key='notes_zstd_v1'",
                 [],
-                |r| r.get(0),
+                |row| row.get(0),
             )
             .optional()?;
-        if version.is_none() {
-            for block in self.blocks()? {
-                self.index_block(&block)?;
-            }
+        if done.is_some() {
+            return Ok(());
+        }
+        let rows: Vec<(String, Vec<u8>)> = if self.table_exists("notes")? {
             self.conn
-                .execute("INSERT INTO metadata VALUES('chain_index_v1', '1')", [])?;
+                .prepare("SELECT id, data FROM notes")?
+                .query_map([], |row| {
+                    let data: rusqlite::types::Value = row.get(1)?;
+                    let bytes = match data {
+                        rusqlite::types::Value::Text(text) => text.into_bytes(),
+                        rusqlite::types::Value::Blob(bytes) => bytes,
+                        _ => {
+                            return Err(rusqlite::Error::InvalidColumnType(
+                                1,
+                                "data".into(),
+                                rusqlite::types::Type::Null,
+                            ))
+                        }
+                    };
+                    Ok((row.get(0)?, bytes))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            Vec::new()
+        };
+        let mut update = self.conn.prepare("UPDATE notes SET data=? WHERE id=?")?;
+        for (id, data) in rows {
+            if data.starts_with(&ZSTD_MAGIC) {
+                continue;
+            }
+            let receipt: Receipt = serde_json::from_slice(&data)?;
+            update.execute(params![encode_note(&receipt)?, id])?;
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO metadata VALUES('notes_zstd_v1', '1')",
+            [],
+        )?;
+        Ok(())
+    }
+    /// Stores per-epoch nullifiers as 32-byte blobs instead of hex text.
+    fn migrate_nullifier_blobs(&self) -> Result<()> {
+        let done: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='nullifiers_blob_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if done.is_some() {
+            return Ok(());
+        }
+        let rows: Vec<(String, u32, String, Option<u32>)> = if self
+            .table_exists("note_nullifiers")?
+        {
+            self.conn
+                .prepare("SELECT note_id, epoch, nullifier, spent_height FROM note_nullifiers")?
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            Vec::new()
+        };
+        if rows.is_empty() {
+            // Nothing to convert; SQLite's dynamic typing accepts blobs later.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO metadata VALUES('nullifiers_blob_v1', '1')",
+                [],
+            )?;
+            return Ok(());
+        }
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS note_nullifiers_v2;
+             CREATE TABLE note_nullifiers_v2 (
+                note_id TEXT NOT NULL, epoch INTEGER NOT NULL,
+                nullifier BLOB NOT NULL UNIQUE, spent_height INTEGER,
+                PRIMARY KEY(note_id, epoch));
+             CREATE INDEX note_nullifiers_v2_by_spend ON note_nullifiers_v2(spent_height);",
+        )?;
+        {
+            let mut insert = self.conn.prepare(
+                "INSERT OR IGNORE INTO note_nullifiers_v2 VALUES(?, ?, ?, ?)",
+            )?;
+            for (note_id, epoch, nullifier, spent_height) in &rows {
+                insert.execute(params![note_id, epoch, hex::decode(nullifier)?, spent_height])?;
+            }
+        }
+        self.conn.execute_batch(
+            "DROP TABLE note_nullifiers;
+             ALTER TABLE note_nullifiers_v2 RENAME TO note_nullifiers;
+             DROP INDEX IF EXISTS note_nullifiers_v2_by_spend;
+             CREATE INDEX IF NOT EXISTS note_nullifiers_by_spend
+                ON note_nullifiers(spent_height);",
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO metadata VALUES('nullifiers_blob_v1', '1')",
+            [],
+        )?;
+        Ok(())
+    }
+    /// A block's JSON without its stamp members; they live in `chain_members`.
+    fn stripped(block: &Block) -> Result<String> {
+        let mut stored = block.clone();
+        for stamp in &mut stored.stamps {
+            stamp.tachygrams.clear();
+        }
+        Ok(serde_json::to_string(&stored)?)
+    }
+    /// Fills each block's stamps from `chain_members`, in stamp/index order.
+    fn attach_members(&self, blocks: &mut [Block]) -> Result<()> {
+        let Some(first) = blocks.first().map(|block| block.height) else {
+            return Ok(());
+        };
+        let last = blocks.last().map(|block| block.height).unwrap_or(first);
+        let mut members: BTreeMap<u32, Vec<(usize, Vec<u8>)>> = BTreeMap::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT height, stamp, value FROM chain_members
+                 WHERE height BETWEEN ? AND ? ORDER BY height, stamp, idx",
+            )?;
+            let mut rows = statement.query(params![first, last])?;
+            while let Some(row) = rows.next()? {
+                members
+                    .entry(row.get(0)?)
+                    .or_default()
+                    .push((row.get(1)?, row.get(2)?));
+            }
+        }
+        for block in blocks {
+            let Some(stamps) = members.get(&block.height) else {
+                continue;
+            };
+            for (index, value) in stamps {
+                if let Some(stamp) = block.stamps.get_mut(*index) {
+                    stamp.tachygrams.push(hex::encode(value));
+                }
+            }
         }
         Ok(())
     }
@@ -521,17 +922,112 @@ impl Store {
             |row| row.get(0),
         )?)
     }
+    /// The height that published one of the wallet's own note commitments.
+    pub fn note_height(&self, id: &str) -> Result<Option<u32>> {
+        self.ensure_notes_resolved()?;
+        self.conn
+            .query_row("SELECT height FROM note_heights WHERE id=?", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+    /// Where a published value sits, scanning the member table. Rare path:
+    /// wallet notes and nullifiers are indexed during `put_block`.
+    fn note_location(&self, id: &str) -> Result<Option<(u32, u32)>> {
+        let value = hex::decode(id)?;
+        self.conn
+            .query_row(
+                "SELECT height, stamp FROM chain_members WHERE value=? LIMIT 1",
+                [value],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
     pub fn tachygram_height(&self, id: &str) -> Result<Option<u32>> {
         self.ensure_indexes()?;
-        Ok(self
+        Ok(self.note_location(id)?.map(|(height, _)| height))
+    }
+    /// Indexes receipts that arrived after their block, in one pass over the
+    /// retained members. Notes it cannot find are remembered as absent, so
+    /// balances do not rescan for notes that are simply not mined yet.
+    pub fn resolve_notes(&self) -> Result<u64> {
+        if self.read_only {
+            return Ok(0);
+        }
+        self.ensure_indexes()?;
+        let unresolved: Vec<String> = self
             .conn
-            .query_row(
-                "SELECT MIN(height) FROM tachygrams WHERE id=?",
+            .prepare(
+                "SELECT notes.id FROM notes
+                 WHERE NOT EXISTS (SELECT 1 FROM note_heights WHERE note_heights.id=notes.id)
+                   AND NOT EXISTS (SELECT 1 FROM note_absent WHERE note_absent.id=notes.id)",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if unresolved.is_empty() {
+            return Ok(0);
+        }
+        let mut wanted: HashMap<Vec<u8>, String> = HashMap::new();
+        for id in &unresolved {
+            if let Ok(value) = hex::decode(id) {
+                wanted.insert(value, id.clone());
+            }
+        }
+        let mut resolved = 0;
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT height, stamp, value FROM chain_members ORDER BY height, stamp, idx",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let value: Vec<u8> = row.get(2)?;
+                let Some(id) = wanted.remove(&value) else {
+                    continue;
+                };
+                let height: u32 = row.get(0)?;
+                let stamp: u32 = row.get(1)?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO note_heights VALUES(?, ?)",
+                    params![id, height],
+                )?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO chain_note_stamps VALUES(?, ?, ?)",
+                    params![id, height, stamp],
+                )?;
+                resolved += 1;
+                if wanted.is_empty() {
+                    break;
+                }
+            }
+        }
+        for id in wanted.values() {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO note_absent VALUES(?)",
                 [id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten())
+            )?;
+        }
+        Ok(resolved)
+    }
+    /// Resolves late-imported receipts once, only when some note is neither
+    /// indexed nor known to be absent.
+    fn ensure_notes_resolved(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        self.ensure_indexes()?;
+        let pending: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM notes n
+             WHERE NOT EXISTS (SELECT 1 FROM note_heights h WHERE h.id=n.id)
+               AND NOT EXISTS (SELECT 1 FROM note_absent a WHERE a.id=n.id))",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending {
+            self.resolve_notes()?;
+        }
+        Ok(())
     }
     pub fn has_transaction(&self, txid: &str) -> Result<bool> {
         self.ensure_indexes()?;
@@ -577,13 +1073,9 @@ impl Store {
             .map(Option::flatten)
     }
     pub fn block(&self, height: u32) -> Result<Option<Block>> {
-        self.conn
-            .query_row("SELECT data FROM blocks WHERE height=?", [height], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()?
-            .map(|data| Ok(serde_json::from_str(&data)?))
-            .transpose()
+        self.ensure_indexes()?;
+        let mut blocks = self.read_headers(Some((height, height)))?;
+        Ok(blocks.pop())
     }
     pub fn clear_funding_snapshot(&self) -> Result<()> {
         if self.table_exists("funding_snapshot")? {
@@ -690,9 +1182,13 @@ impl Store {
     pub fn clear_chain(&self) -> Result<()> {
         self.ensure_proof_tables()?;
         self.conn.execute("DELETE FROM blocks", [])?;
-        if self.table_exists("tachygrams")? {
-            self.conn.execute("DELETE FROM tachygrams", [])?;
-            self.conn.execute("DELETE FROM block_transactions", [])?;
+        self.conn.execute("DELETE FROM block_transactions", [])?;
+        if self.table_exists("chain_members")? {
+            self.conn.execute("DELETE FROM chain_members", [])?;
+            self.conn.execute("DELETE FROM chain_note_stamps", [])?;
+        }
+        if self.table_exists("chain_stamps")? {
+            self.conn.execute("DELETE FROM chain_stamps", [])?;
         }
         self.conn.execute("DELETE FROM epoch_proofs", [])?;
         self.conn.execute("DELETE FROM spendable_proofs", [])?;
@@ -703,62 +1199,181 @@ impl Store {
             self.conn
                 .execute("UPDATE note_nullifiers SET spent_height=NULL", [])?;
         }
+        if self.table_exists("note_heights")? {
+            self.conn.execute("DELETE FROM note_heights", [])?;
+        }
         self.clear_funding_snapshot()
     }
+    /// Reclaims pages freed by deletes. Needs temporary disk space about the
+    /// size of the database; call outside any transaction.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
+    /// Drops old stamp members, keeping whole stamps that created a still-unspent
+    /// note and every stamp of the last `keep_epochs` epochs. Blocks stay as
+    /// headers/stamps; their members are reattached from `chain_members` on read.
+    pub fn compact_chain(&self, keep_epochs: u32) -> Result<CompactStats> {
+        self.ensure_indexes()?;
+        let Some(tip) = self.tip()? else {
+            return Ok(CompactStats::default());
+        };
+        let mut stats = CompactStats::default();
+        // Receipts past their expiry can never be mined; keep the rest.
+        if self.table_exists("pending_meta")? {
+            // Expired receipts and their operation records can never be mined.
+            // Delete the child rows first: `operations` references `pending`.
+            if self.table_exists("operations")? {
+                self.conn.execute(
+                    "DELETE FROM operations WHERE txid IN
+                     (SELECT txid FROM pending_meta WHERE expiry < ?)",
+                    [tip.height],
+                )?;
+            }
+            stats.pending = u64::try_from(self.conn.execute(
+                "DELETE FROM pending WHERE txid IN
+                 (SELECT txid FROM pending_meta WHERE expiry < ?)",
+                [tip.height],
+            )?).unwrap_or(0);
+            self.conn.execute(
+                "DELETE FROM pending_meta WHERE NOT EXISTS
+                 (SELECT 1 FROM pending p WHERE p.txid = pending_meta.txid)",
+                [],
+            )?;
+        }
+        let cutoff = tip.epoch.saturating_sub(keep_epochs);
+        if cutoff == 0 {
+            return Ok(stats);
+        }
+        let cutoff_height = tip
+            .activation_height
+            .checked_add(cutoff.checked_mul(EPOCH_SIZE).context("epoch overflow")?)
+            .context("height overflow")?;
+        // Old transaction rows only served pending detection; receipts that
+        // old expired long ago, and the chain itself carries the proofs.
+        self.conn
+            .execute("DELETE FROM block_transactions WHERE height < ?", [cutoff_height])?;
+        // Stamps holding an unspent note's commitment must stay complete.
+        let mut keep: HashMap<u32, Vec<u32>> = HashMap::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT ns.height, ns.stamp FROM chain_note_stamps ns
+                 WHERE NOT EXISTS (SELECT 1 FROM note_nullifiers nn
+                                   WHERE nn.note_id = ns.note_id AND nn.spent_height IS NOT NULL)",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                keep.entry(row.get(0)?).or_default().push(row.get(1)?);
+            }
+        }
+        let mut heights: Vec<(u32, u32)> = self
+            .conn
+            .prepare(
+                "SELECT height, epoch FROM blocks
+                 WHERE height < ?1
+                   AND EXISTS(SELECT 1 FROM chain_members m WHERE m.height = blocks.height)
+                 ORDER BY height",
+            )?
+            .query_map([cutoff_height], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if heights.is_empty() {
+            return Ok(CompactStats::default());
+        }
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS thin_blocks (height INTEGER PRIMARY KEY, epoch INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS thin_blocks_by_epoch ON thin_blocks(epoch);",
+        )?;
+        for (height, epoch) in heights {
+            let deleted = match keep.get(&height) {
+                Some(stamps) if !stamps.is_empty() => {
+                    let list = stamps
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    self.conn.execute(
+                        &format!(
+                            "DELETE FROM chain_members WHERE height=? AND stamp NOT IN ({list})"
+                        ),
+                        [height],
+                    )?
+                }
+                _ => self
+                    .conn
+                    .execute("DELETE FROM chain_members WHERE height=?", [height])?,
+            };
+            if deleted > 0 {
+                stats.blocks += 1;
+                stats.members += u64::try_from(deleted).unwrap_or(0);
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO thin_blocks VALUES(?, ?)",
+                    params![height, epoch],
+                )?;
+            }
+        }
+        Ok(stats)
+    }
     pub fn notes(&self) -> Result<Vec<Receipt>> {
-        self.read_all("SELECT data FROM notes ORDER BY id")
+        self.conn
+            .prepare("SELECT data FROM notes ORDER BY id")?
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| decode_note(&row?))
+            .collect()
     }
     pub fn unresolved_notes(&self) -> Result<Vec<Receipt>> {
-        self.ensure_indexes()?;
+        self.ensure_notes_resolved()?;
         self.conn
             .prepare(
                 "SELECT data FROM notes
-                 WHERE NOT EXISTS (SELECT 1 FROM tachygrams WHERE id=notes.id)
+                 WHERE NOT EXISTS (SELECT 1 FROM note_heights WHERE note_heights.id=notes.id)
                  ORDER BY id",
             )?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| decode_note(&row?))
             .collect()
     }
     pub fn confirmed_unspent_note_rows(&self) -> Result<Vec<(String, String)>> {
-        self.ensure_indexes()?;
+        self.ensure_notes_resolved()?;
         self.conn
             .prepare(
                 "SELECT notes.id, notes.data FROM notes
-                 WHERE EXISTS (SELECT 1 FROM tachygrams WHERE tachygrams.id=notes.id)
+                 WHERE EXISTS (SELECT 1 FROM note_heights WHERE note_heights.id=notes.id)
                  AND NOT EXISTS (
                     SELECT 1 FROM note_nullifiers
                     WHERE note_nullifiers.note_id=notes.id
                     AND note_nullifiers.spent_height IS NOT NULL
                  ) ORDER BY notes.id",
             )?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+            .map(|row| {
+                let (id, data) = row?;
+                Ok((id, decode_note_json(&data)?))
+            })
+            .collect::<Result<Vec<_>>>()
     }
     pub fn note(&self, id: &str) -> Result<Option<Receipt>> {
-        let data: Option<String> = self
+        let data: Option<Vec<u8>> = self
             .conn
             .query_row("SELECT data FROM notes WHERE id=?", [id], |row| row.get(0))
             .optional()?;
-        data.map(|data| serde_json::from_str(&data).map_err(Into::into))
-            .transpose()
+        data.map(|data| decode_note(&data)).transpose()
     }
     pub fn confirmed_notes_without_nullifier(&self, epoch: u32) -> Result<Vec<Receipt>> {
-        self.ensure_indexes()?;
+        self.ensure_notes_resolved()?;
         self.conn
             .prepare(
                 "SELECT notes.data FROM notes
                  LEFT JOIN note_nullifiers nn ON nn.note_id=notes.id AND nn.epoch=?
                  WHERE nn.note_id IS NULL
-                 AND EXISTS (SELECT 1 FROM tachygrams WHERE id=notes.id)
+                 AND EXISTS (SELECT 1 FROM note_heights WHERE id=notes.id)
                  AND NOT EXISTS (
                     SELECT 1 FROM note_nullifiers spent
                     WHERE spent.note_id=notes.id AND spent.spent_height IS NOT NULL
                  ) ORDER BY notes.id",
             )?
-            .query_map([epoch], |row| row.get::<_, String>(0))?
-            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .query_map([epoch], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| decode_note(&row?))
             .collect()
     }
     pub fn notes_without_nullifier(&self, epoch: u32) -> Result<Vec<Receipt>> {
@@ -773,8 +1388,8 @@ impl Store {
                     WHERE spent.note_id=notes.id AND spent.spent_height IS NOT NULL
                  ) ORDER BY notes.id",
             )?
-            .query_map([epoch], |row| row.get::<_, String>(0))?
-            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .query_map([epoch], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| decode_note(&row?))
             .collect()
     }
     pub fn note_nullifier_epochs(&self, note_id: &str) -> Result<BTreeSet<u32>> {
@@ -795,7 +1410,7 @@ impl Store {
         self.ensure_indexes()?;
         self.conn.execute(
             "INSERT INTO note_nullifiers VALUES(?, ?, ?, ?) ON CONFLICT DO NOTHING",
-            params![note_id, epoch, nullifier, spent_height],
+            params![note_id, epoch, hex::decode(nullifier)?, spent_height],
         )?;
         Ok(())
     }
@@ -808,11 +1423,12 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn mined_note_ids(&self) -> Result<BTreeSet<String>> {
-        self.ensure_indexes()?;
+        self.ensure_notes_resolved()?;
         Ok(self
             .conn
             .prepare(
-                "SELECT DISTINCT notes.id FROM notes JOIN tachygrams ON tachygrams.id=notes.id",
+                "SELECT DISTINCT notes.id FROM notes
+                 JOIN note_heights ON note_heights.id=notes.id",
             )?
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?)
@@ -971,10 +1587,57 @@ impl Store {
     }
     pub fn put_block(&self, block: &Block) -> Result<()> {
         self.ensure_indexes()?;
+        // Replace this height's header, stamps and members (reorg refetches reuse it).
         self.conn.execute(
-            "INSERT INTO blocks VALUES(?, ?) ON CONFLICT(height) DO UPDATE SET data=excluded.data",
-            params![block.height, serde_json::to_string(block)?],
+            "INSERT OR REPLACE INTO blocks VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                block.height,
+                hex::decode(&block.hash)?,
+                hex::decode(&block.previous_block_hash)?,
+                block.activation_height,
+                block.pool_height,
+                block.epoch,
+                block.epoch_length,
+                hex::decode(&block.anchor_before)?,
+                block
+                    .epoch_start_anchor
+                    .as_deref()
+                    .map(hex::decode)
+                    .transpose()?,
+                hex::decode(&block.anchor_after)?
+            ],
         )?;
+        self.conn
+            .execute("DELETE FROM chain_stamps WHERE height=?", [block.height])?;
+        for (index, stamp) in block.stamps.iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO chain_stamps VALUES(?, ?, ?, ?, ?)",
+                params![
+                    block.height,
+                    index as u32,
+                    stamp.transaction_index as u32,
+                    hex::decode(&stamp.txid)?,
+                    hex::decode(&stamp.tachygram_set)?
+                ],
+            )?;
+        }
+        self.conn
+            .execute("DELETE FROM chain_members WHERE height=?", [block.height])?;
+        {
+            let mut insert = self
+                .conn
+                .prepare_cached("INSERT OR IGNORE INTO chain_members VALUES(?, ?, ?, ?)")?;
+            for (index, stamp) in block.stamps.iter().enumerate() {
+                for (position, member) in stamp.tachygrams.iter().enumerate() {
+                    insert.execute(params![
+                        block.height,
+                        index as u32,
+                        position as u32,
+                        hex::decode(member)?
+                    ])?;
+                }
+            }
+        }
         self.index_block(block)?;
         if block.is_thin() {
             // Created on first use, so read-only commands work on older wallets.
@@ -1007,11 +1670,17 @@ impl Store {
             self.conn
                 .execute("DELETE FROM thin_blocks WHERE height > ?", [height])?;
         }
-        if self.table_exists("tachygrams")? {
+        self.conn
+            .execute("DELETE FROM block_transactions WHERE height > ?", [height])?;
+        if self.table_exists("chain_stamps")? {
             self.conn
-                .execute("DELETE FROM tachygrams WHERE height > ?", [height])?;
+                .execute("DELETE FROM chain_stamps WHERE height > ?", [height])?;
+        }
+        if self.table_exists("chain_members")? {
             self.conn
-                .execute("DELETE FROM block_transactions WHERE height > ?", [height])?;
+                .execute("DELETE FROM chain_members WHERE height > ?", [height])?;
+            self.conn
+                .execute("DELETE FROM chain_note_stamps WHERE height > ?", [height])?;
         }
         if self
             .funding_snapshot()?
@@ -1025,6 +1694,10 @@ impl Store {
                 [height],
             )?;
         }
+        if self.table_exists("note_heights")? {
+            self.conn
+                .execute("DELETE FROM note_heights WHERE height > ?", [height])?;
+        }
         self.rewind_proofs(height)
     }
     fn rewind_proofs(&self, _height: u32) -> Result<()> {
@@ -1035,14 +1708,14 @@ impl Store {
         Ok(())
     }
     pub fn put_note(&self, receipt: &Receipt) -> Result<()> {
-        let existing: Option<String> = self
+        let existing: Option<Vec<u8>> = self
             .conn
             .query_row("SELECT data FROM notes WHERE id=?", [receipt.id()?], |r| {
                 r.get(0)
             })
             .optional()?;
         if let Some(existing) = existing {
-            let mut previous: Receipt = serde_json::from_str(&existing)?;
+            let mut previous: Receipt = decode_note(&existing)?;
             let mut incoming = receipt.clone();
             let locator = incoming.locator.take().or(previous.locator.take());
             previous.locator = None;
@@ -1053,14 +1726,16 @@ impl Store {
             incoming.locator = locator;
             self.conn.execute(
                 "UPDATE notes SET data=? WHERE id=?",
-                params![serde_json::to_string(&incoming)?, receipt.id()?],
+                params![encode_note(&incoming)?, receipt.id()?],
             )?;
         } else {
             self.conn.execute(
                 "INSERT INTO notes VALUES(?, ?)",
-                params![receipt.id()?, serde_json::to_string(receipt)?],
+                params![receipt.id()?, encode_note(receipt)?],
             )?;
         }
+        // Its height is indexed when the block arrives, or by `resolve_notes`
+        // when the receipt is imported after its block.
         Ok(())
     }
     pub fn reserve(&self, pending: &Pending) -> Result<()> {

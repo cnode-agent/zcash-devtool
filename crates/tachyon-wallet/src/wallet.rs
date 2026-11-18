@@ -176,6 +176,18 @@ enum Operation {
         #[arg(long)]
         sizes: bool,
     },
+    /// Offline: drop old blocks' stamp members and their tachygram index, so the
+    /// wallet keeps only headers, stamps, anchors and its own note heights.
+    /// Blocks that created a still-unspent note stay complete. Stop every other
+    /// process using this wallet first.
+    Compact {
+        /// Keep this many recent epochs fully indexed (default 2).
+        #[arg(long, default_value_t = 2)]
+        keep_epochs: u32,
+        /// Skip the VACUUM that reclaims the freed pages (needs temp space).
+        #[arg(long)]
+        no_vacuum: bool,
+    },
 }
 
 impl Command {
@@ -287,6 +299,27 @@ impl Command {
         if let Operation::Prune { compact, sizes } = self.command {
             return crate::store::prune(&self.wallet_dir, compact, sizes, control);
         }
+        if let Operation::Compact {
+            keep_epochs,
+            no_vacuum,
+        } = self.command
+        {
+            control.stage("Opening wallet database…")?;
+            let store = Store::open(&self.wallet_dir, false)?;
+            control.stage("Compacting old chain blocks…")?;
+            let stats = store.compact_chain(keep_epochs)?;
+            store.commit()?;
+            if !no_vacuum {
+                control.stage("Vacuuming…")?;
+                store.vacuum()?;
+            }
+            return Ok(json!({
+                "blocks_thinned": stats.blocks,
+                "members_dropped": stats.members,
+                "pending_pruned": stats.pending,
+                "vacuumed": !no_vacuum,
+            }));
+        }
         control.stage("Opening wallet database…")?;
         let read_only = matches!(
             self.command,
@@ -311,7 +344,9 @@ impl Command {
             .transpose()?;
         let oss = oss.as_ref();
         let result = match self.command {
-            Operation::Init { .. } | Operation::Prune { .. } => unreachable!("handled above"),
+            Operation::Init { .. } | Operation::Prune { .. } | Operation::Compact { .. } => {
+                unreachable!("handled above")
+            }
             Operation::Address => addresses(&config)?,
             operation @ (Operation::Balance | Operation::BalanceSummary) => {
                 let summary = matches!(operation, Operation::BalanceSummary);
