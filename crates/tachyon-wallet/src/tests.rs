@@ -710,6 +710,52 @@ fn store_indexes_new_blocks_and_rewinds_without_rescanning() -> Result<()> {
 }
 
 #[test]
+fn compact_chain_keeps_unspent_creation_blocks_and_note_heights() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    let store = crate::store::Store::open(directory.path(), true)?;
+    let mut blocks = vec![genesis()];
+    let receipt = own(1_000_000);
+    let funded = shield(&blocks, &receipt)?;
+    mine(&mut blocks, Some(&funded))?;
+    // A second stamped block that belongs to no wallet note: it is compacted.
+    let other = own(2_000_000);
+    let funded2 = shield(&blocks, &other)?;
+    mine(&mut blocks, Some(&funded2))?;
+    while blocks.last().unwrap().epoch < 2 {
+        mine(&mut blocks, None)?;
+    }
+    for block in &blocks {
+        store.put_block(block)?;
+    }
+    store.put_note(&receipt)?;
+    let id = receipt.id()?;
+    assert_eq!(store.note_height(&id)?, Some(9));
+    assert!(store.unresolved_notes()?.is_empty());
+
+    // The note is unspent: its creation block keeps its members.
+    let stats = store.compact_chain(1)?;
+    assert!(stats.blocks > 0);
+    assert!(!store.block(9)?.expect("block 9").is_thin());
+    assert!(store.block(10)?.expect("block 10").is_thin());
+    let kept = store.block(9)?.expect("block 9");
+    assert!(kept.stamps.iter().any(|stamp| stamp.tachygrams.iter().any(|member| member == &id)));
+
+    // Once spent, the old creation block may be thinned, but the wallet still
+    // knows the note and where it was published.
+    store.put_note_nullifier(&id, 0, "00", Some(9))?;
+    store.compact_chain(1)?;
+    assert!(store.block(9)?.expect("block 9").is_thin());
+    assert_eq!(store.note_height(&id)?, Some(9));
+    assert!(store.unresolved_notes()?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn note_spend_tracking_updates_from_new_blocks_and_rewinds() -> Result<()> {
     let directory = tempfile::tempdir()?;
     #[cfg(unix)]

@@ -17,6 +17,13 @@ use zcash_tachyon::{Anchor, EpochIndex, QrProfile, Tachygram, constants::EPOCH_S
 mod prune;
 pub use prune::prune;
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompactStats {
+    pub blocks: u64,
+    pub members: u64,
+    pub json_bytes: i64,
+}
+
 /// Cached lineages deleted per statement (each one is about 512 KiB).
 pub(crate) const PRUNE_BATCH: usize = 1024;
 
@@ -162,10 +169,18 @@ impl ChainData<'_> {
         let id = hex::encode(Fp::from(cm).to_bytes());
         let blocks: Vec<Block> = match self {
             Self::Blocks(blocks) => blocks.to_vec(),
-            Self::Store(store) => match store.tachygram_height(&id)? {
-                Some(height) => store.block(height)?.into_iter().collect(),
-                None => Vec::new(),
-            },
+            Self::Store(store) => {
+                // The compact per-note index survives chain compaction; the
+                // tachygram index is the fallback while the block is still full.
+                let height = match store.note_height(&id)? {
+                    Some(height) => Some(height),
+                    None => store.tachygram_height(&id)?,
+                };
+                match height {
+                    Some(height) => store.block(height)?.into_iter().collect(),
+                    None => Vec::new(),
+                }
+            }
         };
         for block in blocks {
             let mut cursor = block.entry()?;
@@ -188,7 +203,12 @@ impl ChainData<'_> {
                 .iter()
                 .flat_map(|block| &block.stamps)
                 .any(|stamp| stamp.tachygrams.contains(&id))),
-            Self::Store(store) => Ok(store.tachygram_height(&id)?.is_some()),
+            Self::Store(store) => Ok(store.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM note_nullifiers
+                               WHERE nullifier=? AND spent_height IS NOT NULL)",
+                [&id],
+                |row| row.get(0),
+            )?),
         }
     }
 
@@ -456,12 +476,16 @@ impl Store {
             .collect()
     }
     fn index_block(&self, block: &Block) -> Result<()> {
+        let mut note_height = self.conn.prepare_cached(
+            "INSERT OR IGNORE INTO note_heights SELECT id, ?2 FROM notes WHERE id = ?1",
+        )?;
         for stamp in &block.stamps {
             for member in &stamp.tachygrams {
                 self.conn.execute(
                     "INSERT INTO tachygrams VALUES(?, ?) ON CONFLICT DO NOTHING",
                     params![member, block.height],
                 )?;
+                note_height.execute(params![member, block.height])?;
             }
         }
         for txid in &block.transactions {
@@ -490,7 +514,9 @@ impl Store {
              CREATE TABLE IF NOT EXISTS note_nullifiers (
                 note_id TEXT NOT NULL, epoch INTEGER NOT NULL, nullifier TEXT NOT NULL UNIQUE,
                 spent_height INTEGER, PRIMARY KEY(note_id, epoch));
-             CREATE INDEX IF NOT EXISTS note_nullifiers_by_spend ON note_nullifiers(spent_height);",
+             CREATE INDEX IF NOT EXISTS note_nullifiers_by_spend ON note_nullifiers(spent_height);
+             CREATE TABLE IF NOT EXISTS note_heights (id TEXT PRIMARY KEY, height INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS note_heights_by_height ON note_heights(height);",
         )?;
         let version: Option<String> = self
             .conn
@@ -507,6 +533,25 @@ impl Store {
             self.conn
                 .execute("INSERT INTO metadata VALUES('chain_index_v1', '1')", [])?;
         }
+        // One-time backfill: a note's height survives compaction of the chain.
+        let heights: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='note_heights_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if heights.is_none() {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO note_heights
+                 SELECT notes.id, MIN(tachygrams.height) FROM notes
+                 JOIN tachygrams ON tachygrams.id = notes.id GROUP BY notes.id",
+                [],
+            )?;
+            self.conn
+                .execute("INSERT INTO metadata VALUES('note_heights_v1', '1')", [])?;
+        }
         Ok(())
     }
     /// Whether some block of `epoch` was synced thin, so the tachygram index
@@ -520,6 +565,16 @@ impl Store {
             [epoch],
             |row| row.get(0),
         )?)
+    }
+    /// The height that published one of the wallet's own note commitments.
+    pub fn note_height(&self, id: &str) -> Result<Option<u32>> {
+        self.ensure_indexes()?;
+        self.conn
+            .query_row("SELECT height FROM note_heights WHERE id=?", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
     }
     pub fn tachygram_height(&self, id: &str) -> Result<Option<u32>> {
         self.ensure_indexes()?;
@@ -703,7 +758,102 @@ impl Store {
             self.conn
                 .execute("UPDATE note_nullifiers SET spent_height=NULL", [])?;
         }
+        if self.table_exists("note_heights")? {
+            self.conn.execute("DELETE FROM note_heights", [])?;
+        }
         self.clear_funding_snapshot()
+    }
+    /// Reclaims pages freed by deletes. Needs temporary disk space about the
+    /// size of the database; call outside any transaction.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
+    /// Turns old blocks thin: their stamp members (the tachygram index) are
+    /// dropped, while headers, stamps, anchors and the wallet's own note heights
+    /// remain. Blocks holding an unspent note's creation stamp stay complete so
+    /// the note can still be spent locally. `VACUUM` afterwards to reclaim pages.
+    pub fn compact_chain(&self, keep_epochs: u32) -> Result<CompactStats> {
+        self.ensure_indexes()?;
+        let Some(tip) = self.tip()? else {
+            return Ok(CompactStats::default());
+        };
+        let cutoff = tip.epoch.saturating_sub(keep_epochs);
+        if cutoff == 0 {
+            return Ok(CompactStats::default());
+        }
+        let cutoff_height = tip
+            .activation_height
+            .checked_add(cutoff.checked_mul(EPOCH_SIZE).context("epoch overflow")?)
+            .context("height overflow")?;
+        // Creation blocks of notes that are still unspent must stay complete.
+        let mut keep = BTreeSet::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT nh.height FROM note_heights nh
+                 WHERE NOT EXISTS (SELECT 1 FROM note_nullifiers nn
+                                   WHERE nn.note_id = nh.id AND nn.spent_height IS NOT NULL)",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                keep.insert(row.get::<_, u32>(0)?);
+            }
+        }
+        let mut updates = Vec::new();
+        let mut stats = CompactStats::default();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT height, data FROM blocks WHERE height < ?1 ORDER BY height")?;
+            let mut rows = stmt.query([cutoff_height])?;
+            while let Some(row) = rows.next()? {
+                let height: u32 = row.get(0)?;
+                let data: String = row.get(1)?;
+                if keep.contains(&height) {
+                    continue;
+                }
+                let block: Block = serde_json::from_str(&data)?;
+                if block.is_thin() || block.stamps.is_empty() {
+                    continue;
+                }
+                let mut thin = block.clone();
+                for stamp in &mut thin.stamps {
+                    stamp.tachygrams.clear();
+                }
+                let slim = serde_json::to_string(&thin)?;
+                stats.blocks += 1;
+                stats.members += block
+                    .stamps
+                    .iter()
+                    .map(|stamp| u64::try_from(stamp.tachygrams.len()).unwrap_or(0))
+                    .sum::<u64>();
+                stats.json_bytes += i64::try_from(data.len()).unwrap_or(0)
+                    - i64::try_from(slim.len()).unwrap_or(0);
+                updates.push((height, thin.epoch, slim));
+            }
+        }
+        if updates.is_empty() {
+            return Ok(stats);
+        }
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS thin_blocks (height INTEGER PRIMARY KEY, epoch INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS thin_blocks_by_epoch ON thin_blocks(epoch);",
+        )?;
+        // Run in the caller's transaction: the store commits once per command.
+        for (height, epoch, data) in &updates {
+            self.conn.execute(
+                "UPDATE blocks SET data=? WHERE height=?",
+                params![data, height],
+            )?;
+            self.conn
+                .execute("DELETE FROM tachygrams WHERE height=?", [height])?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO thin_blocks VALUES(?, ?)",
+                params![height, epoch],
+            )?;
+        }
+        Ok(stats)
     }
     pub fn notes(&self) -> Result<Vec<Receipt>> {
         self.read_all("SELECT data FROM notes ORDER BY id")
@@ -713,7 +863,7 @@ impl Store {
         self.conn
             .prepare(
                 "SELECT data FROM notes
-                 WHERE NOT EXISTS (SELECT 1 FROM tachygrams WHERE id=notes.id)
+                 WHERE NOT EXISTS (SELECT 1 FROM note_heights WHERE note_heights.id=notes.id)
                  ORDER BY id",
             )?
             .query_map([], |row| row.get::<_, String>(0))?
@@ -725,7 +875,7 @@ impl Store {
         self.conn
             .prepare(
                 "SELECT notes.id, notes.data FROM notes
-                 WHERE EXISTS (SELECT 1 FROM tachygrams WHERE tachygrams.id=notes.id)
+                 WHERE EXISTS (SELECT 1 FROM note_heights WHERE note_heights.id=notes.id)
                  AND NOT EXISTS (
                     SELECT 1 FROM note_nullifiers
                     WHERE note_nullifiers.note_id=notes.id
@@ -751,7 +901,7 @@ impl Store {
                 "SELECT notes.data FROM notes
                  LEFT JOIN note_nullifiers nn ON nn.note_id=notes.id AND nn.epoch=?
                  WHERE nn.note_id IS NULL
-                 AND EXISTS (SELECT 1 FROM tachygrams WHERE id=notes.id)
+                 AND EXISTS (SELECT 1 FROM note_heights WHERE id=notes.id)
                  AND NOT EXISTS (
                     SELECT 1 FROM note_nullifiers spent
                     WHERE spent.note_id=notes.id AND spent.spent_height IS NOT NULL
@@ -1025,6 +1175,10 @@ impl Store {
                 [height],
             )?;
         }
+        if self.table_exists("note_heights")? {
+            self.conn
+                .execute("DELETE FROM note_heights WHERE height > ?", [height])?;
+        }
         self.rewind_proofs(height)
     }
     fn rewind_proofs(&self, _height: u32) -> Result<()> {
@@ -1059,6 +1213,15 @@ impl Store {
             self.conn.execute(
                 "INSERT INTO notes VALUES(?, ?)",
                 params![receipt.id()?, serde_json::to_string(receipt)?],
+            )?;
+        }
+        // Record where the commitment was published if its block is already
+        // synced; `index_block` fills this in when the block arrives later.
+        let id = receipt.id()?;
+        if let Some(height) = self.tachygram_height(&id)? {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO note_heights VALUES(?, ?)",
+                params![id, height],
             )?;
         }
         Ok(())
