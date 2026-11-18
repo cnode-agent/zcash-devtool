@@ -17,6 +17,28 @@ use zcash_tachyon::{Anchor, EpochIndex, QrProfile, Tachygram, constants::EPOCH_S
 mod prune;
 pub use prune::prune;
 
+/// zstd frame magic; older wallets still hold plain JSON receipt rows.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+fn encode_note(receipt: &Receipt) -> Result<Vec<u8>> {
+    Ok(zstd::stream::encode_all(
+        serde_json::to_vec(receipt)?.as_slice(),
+        3,
+    )?)
+}
+
+fn decode_note_json(bytes: &[u8]) -> Result<String> {
+    if bytes.starts_with(&ZSTD_MAGIC) {
+        Ok(String::from_utf8(zstd::stream::decode_all(bytes)?)?)
+    } else {
+        Ok(std::str::from_utf8(bytes)?.to_owned())
+    }
+}
+
+fn decode_note(bytes: &[u8]) -> Result<Receipt> {
+    Ok(serde_json::from_str(&decode_note_json(bytes)?)?)
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CompactStats {
     pub blocks: u64,
@@ -601,6 +623,7 @@ impl Store {
             self.migrate_block_columns()?;
         }
         self.migrate_nullifier_blobs()?;
+        self.migrate_notes_compression()?;
         // Read-only opens must not write: only stamp missing flags.
         for flag in ["chain_index_v1", "note_heights_v1"] {
             let present: Option<String> = self
@@ -733,6 +756,55 @@ impl Store {
         }
         self.conn.execute_batch(
             "DROP TABLE blocks; ALTER TABLE chain_blocks RENAME TO blocks;",
+        )?;
+        Ok(())
+    }
+    /// Compresses receipt JSON once; rows stay readable by their frame magic.
+    fn migrate_notes_compression(&self) -> Result<()> {
+        let done: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='notes_zstd_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if done.is_some() {
+            return Ok(());
+        }
+        let rows: Vec<(String, Vec<u8>)> = if self.table_exists("notes")? {
+            self.conn
+                .prepare("SELECT id, data FROM notes")?
+                .query_map([], |row| {
+                    let data: rusqlite::types::Value = row.get(1)?;
+                    let bytes = match data {
+                        rusqlite::types::Value::Text(text) => text.into_bytes(),
+                        rusqlite::types::Value::Blob(bytes) => bytes,
+                        _ => {
+                            return Err(rusqlite::Error::InvalidColumnType(
+                                1,
+                                "data".into(),
+                                rusqlite::types::Type::Null,
+                            ))
+                        }
+                    };
+                    Ok((row.get(0)?, bytes))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            Vec::new()
+        };
+        let mut update = self.conn.prepare("UPDATE notes SET data=? WHERE id=?")?;
+        for (id, data) in rows {
+            if data.starts_with(&ZSTD_MAGIC) {
+                continue;
+            }
+            let receipt: Receipt = serde_json::from_slice(&data)?;
+            update.execute(params![encode_note(&receipt)?, id])?;
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO metadata VALUES('notes_zstd_v1', '1')",
+            [],
         )?;
         Ok(())
     }
@@ -1243,7 +1315,11 @@ impl Store {
         Ok(stats)
     }
     pub fn notes(&self) -> Result<Vec<Receipt>> {
-        self.read_all("SELECT data FROM notes ORDER BY id")
+        self.conn
+            .prepare("SELECT data FROM notes ORDER BY id")?
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| decode_note(&row?))
+            .collect()
     }
     pub fn unresolved_notes(&self) -> Result<Vec<Receipt>> {
         self.ensure_notes_resolved()?;
@@ -1253,8 +1329,8 @@ impl Store {
                  WHERE NOT EXISTS (SELECT 1 FROM note_heights WHERE note_heights.id=notes.id)
                  ORDER BY id",
             )?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| decode_note(&row?))
             .collect()
     }
     pub fn confirmed_unspent_note_rows(&self) -> Result<Vec<(String, String)>> {
@@ -1269,17 +1345,19 @@ impl Store {
                     AND note_nullifiers.spent_height IS NOT NULL
                  ) ORDER BY notes.id",
             )?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+            .map(|row| {
+                let (id, data) = row?;
+                Ok((id, decode_note_json(&data)?))
+            })
+            .collect::<Result<Vec<_>>>()
     }
     pub fn note(&self, id: &str) -> Result<Option<Receipt>> {
-        let data: Option<String> = self
+        let data: Option<Vec<u8>> = self
             .conn
             .query_row("SELECT data FROM notes WHERE id=?", [id], |row| row.get(0))
             .optional()?;
-        data.map(|data| serde_json::from_str(&data).map_err(Into::into))
-            .transpose()
+        data.map(|data| decode_note(&data)).transpose()
     }
     pub fn confirmed_notes_without_nullifier(&self, epoch: u32) -> Result<Vec<Receipt>> {
         self.ensure_notes_resolved()?;
@@ -1294,8 +1372,8 @@ impl Store {
                     WHERE spent.note_id=notes.id AND spent.spent_height IS NOT NULL
                  ) ORDER BY notes.id",
             )?
-            .query_map([epoch], |row| row.get::<_, String>(0))?
-            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .query_map([epoch], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| decode_note(&row?))
             .collect()
     }
     pub fn notes_without_nullifier(&self, epoch: u32) -> Result<Vec<Receipt>> {
@@ -1310,8 +1388,8 @@ impl Store {
                     WHERE spent.note_id=notes.id AND spent.spent_height IS NOT NULL
                  ) ORDER BY notes.id",
             )?
-            .query_map([epoch], |row| row.get::<_, String>(0))?
-            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .query_map([epoch], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| decode_note(&row?))
             .collect()
     }
     pub fn note_nullifier_epochs(&self, note_id: &str) -> Result<BTreeSet<u32>> {
@@ -1630,14 +1708,14 @@ impl Store {
         Ok(())
     }
     pub fn put_note(&self, receipt: &Receipt) -> Result<()> {
-        let existing: Option<String> = self
+        let existing: Option<Vec<u8>> = self
             .conn
             .query_row("SELECT data FROM notes WHERE id=?", [receipt.id()?], |r| {
                 r.get(0)
             })
             .optional()?;
         if let Some(existing) = existing {
-            let mut previous: Receipt = serde_json::from_str(&existing)?;
+            let mut previous: Receipt = decode_note(&existing)?;
             let mut incoming = receipt.clone();
             let locator = incoming.locator.take().or(previous.locator.take());
             previous.locator = None;
@@ -1648,12 +1726,12 @@ impl Store {
             incoming.locator = locator;
             self.conn.execute(
                 "UPDATE notes SET data=? WHERE id=?",
-                params![serde_json::to_string(&incoming)?, receipt.id()?],
+                params![encode_note(&incoming)?, receipt.id()?],
             )?;
         } else {
             self.conn.execute(
                 "INSERT INTO notes VALUES(?, ?)",
-                params![receipt.id()?, serde_json::to_string(receipt)?],
+                params![receipt.id()?, encode_note(receipt)?],
             )?;
         }
         // Its height is indexed when the block arrives, or by `resolve_notes`
