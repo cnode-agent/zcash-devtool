@@ -316,6 +316,7 @@ impl Command {
             return Ok(json!({
                 "blocks_thinned": stats.blocks,
                 "members_dropped": stats.members,
+                "pending_pruned": stats.pending,
                 "vacuumed": !no_vacuum,
             }));
         }
