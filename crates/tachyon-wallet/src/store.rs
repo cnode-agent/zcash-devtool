@@ -1254,6 +1254,9 @@ impl Store {
         // old expired long ago, and the chain itself carries the proofs.
         self.conn
             .execute("DELETE FROM block_transactions WHERE height < ?", [cutoff_height])?;
+        // A receipt imported after its block is indexed on first lookup; index
+        // it now, while its stamp still has its members.
+        self.resolve_notes()?;
         // Stamps holding an unspent note's commitment must stay complete.
         let mut keep: HashMap<u32, Vec<u32>> = HashMap::new();
         {
