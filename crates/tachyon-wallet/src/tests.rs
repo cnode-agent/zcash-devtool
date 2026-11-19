@@ -757,6 +757,43 @@ fn compact_chain_keeps_unspent_creation_blocks_and_note_heights() -> Result<()> 
 }
 
 #[test]
+fn compact_chain_keeps_the_stamp_of_a_receipt_imported_after_its_block() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    let store = crate::store::Store::open(directory.path(), true)?;
+    let mut blocks = vec![genesis()];
+    let receipt = own(1_000_000);
+    let funded = shield(&blocks, &receipt)?;
+    mine(&mut blocks, Some(&funded))?;
+    while blocks.last().unwrap().epoch < 2 {
+        mine(&mut blocks, None)?;
+    }
+    for block in &blocks {
+        store.put_block(block)?;
+    }
+    // The receipt arrives after its block, and nothing looks it up before
+    // compaction: no balance, no sync.
+    store.put_note(&receipt)?;
+    store.compact_chain(1)?;
+
+    let id = receipt.id()?;
+    let kept = store.block(9)?.expect("block 9");
+    assert!(!kept.is_thin());
+    assert!(
+        kept.stamps
+            .iter()
+            .any(|stamp| stamp.tachygrams.iter().any(|member| member == &id))
+    );
+    assert_eq!(store.note_height(&id)?, Some(9));
+    assert!(store.unresolved_notes()?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn note_spend_tracking_updates_from_new_blocks_and_rewinds() -> Result<()> {
     let directory = tempfile::tempdir()?;
     #[cfg(unix)]
