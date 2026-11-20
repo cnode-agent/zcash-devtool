@@ -693,10 +693,16 @@ pub(crate) fn refresh_note_nullifiers(
     thin: Option<ThinLookup<'_>>,
 ) -> Result<()> {
     let key = SpendingKey::from(config.seed);
+    // One resolution pass, then indexed lookups only: the notes loop below is
+    // per note and an unresolved-notes check here is O(notes) each time.
+    store.resolve_notes()?;
+    // Nullifiers are epoch-specific: only the current epoch's can be published
+    // now, so load its values once rather than scanning the chain per note.
+    let published = store.values_from(config.activation + current_epoch * EPOCH_SIZE)?;
     for receipt in store.notes_without_nullifier(current_epoch)? {
         receipt.check_owner(&key, &config.network_id)?;
         let id = receipt.id()?;
-        let Some(creation) = store.tachygram_height(&id)? else {
+        let Some(creation) = store.note_height_indexed(&id)? else {
             continue;
         };
         let note = receipt.note()?;
@@ -709,9 +715,13 @@ pub(crate) fn refresh_note_nullifiers(
             if existing.contains(&epoch) {
                 continue;
             }
-            let nullifier =
-                hex::encode(Fp::from(master.derive_nullifier(EpochIndex::new(epoch))).to_bytes());
-            let spent_height = store.tachygram_height(&nullifier)?;
+            let value = Fp::from(master.derive_nullifier(EpochIndex::new(epoch))).to_bytes();
+            let nullifier = hex::encode(value);
+            let spent_height = if epoch == current_epoch {
+                published.get(&value[..]).copied()
+            } else {
+                None
+            };
             let ask = spent_height.is_none() && store.thin_epoch(epoch)?;
             // A thin epoch still syncing would be asked about again later.
             if ask && (epoch == current_epoch || thin.is_none()) {

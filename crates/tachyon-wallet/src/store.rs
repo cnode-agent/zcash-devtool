@@ -923,6 +923,15 @@ impl Store {
         )?)
     }
     /// The height that published one of the wallet's own note commitments.
+    /// Indexed lookup only: hot loops must not trigger a members scan.
+    pub fn note_height_indexed(&self, id: &str) -> Result<Option<u32>> {
+        self.conn
+            .query_row("SELECT height FROM note_heights WHERE id=?", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
     pub fn note_height(&self, id: &str) -> Result<Option<u32>> {
         self.ensure_notes_resolved()?;
         self.conn
@@ -948,6 +957,20 @@ impl Store {
     pub fn tachygram_height(&self, id: &str) -> Result<Option<u32>> {
         self.ensure_indexes()?;
         Ok(self.note_location(id)?.map(|(height, _)| height))
+    }
+    /// The first height publishing each value at or after `height`. Used for
+    /// epoch nullifier checks: one indexed pass instead of a scan per note.
+    pub fn values_from(&self, height: u32) -> Result<HashMap<Vec<u8>, u32>> {
+        self.ensure_indexes()?;
+        let mut values = HashMap::new();
+        let mut statement = self
+            .conn
+            .prepare("SELECT value, height FROM chain_members WHERE height >= ? ORDER BY height")?;
+        let mut rows = statement.query([height])?;
+        while let Some(row) = rows.next()? {
+            values.entry(row.get(0)?).or_insert(row.get(1)?);
+        }
+        Ok(values)
     }
     /// Indexes receipts that arrived after their block, in one pass over the
     /// retained members. Notes it cannot find are remembered as absent, so
@@ -1306,10 +1329,11 @@ impl Store {
             if deleted > 0 {
                 stats.blocks += 1;
                 stats.members += u64::try_from(deleted).unwrap_or(0);
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO thin_blocks VALUES(?, ?)",
-                    params![height, epoch],
-                )?;
+                // Deliberately not `thin_blocks`: that flag means sync omitted
+                // spends and checks must ask the OSS. Compaction only removes
+                // members after every spend was already indexed; epoch_blocks
+                // refuses these epochs for local proving via `is_thin()`.
+                let _ = epoch;
             }
         }
         Ok(stats)
