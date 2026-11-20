@@ -387,6 +387,57 @@ fn transparent_send(to: &str, amount_zat: u64) -> Operation {
 }
 
 #[test]
+#[ignore]
+fn consolidate_32_inputs_timing() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    let funding: Vec<u64> = (0..32).map(|index| 200_000 + index * 1_000).collect();
+    install_funding(&node, &address, &funding)?;
+    for _ in 0..32 {
+        command(
+            &dir,
+            Operation::Shield {
+                amount_zat: Some(100_000),
+                txid: None,
+                index: None,
+            },
+        )?;
+        node.mine()?;
+    }
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 10_000,
+            from_height: None,
+        },
+    )?;
+    let before = command(&dir, Operation::BalanceSummary)?["notes"]
+        .as_array()
+        .unwrap()
+        .len();
+    let start = std::time::Instant::now();
+    command(&dir, Operation::Consolidate { max_inputs: 32 })?;
+    let elapsed = start.elapsed();
+    node.mine()?;
+    command(
+        &dir,
+        Operation::Sync {
+            max_blocks: 10_000,
+            from_height: None,
+        },
+    )?;
+    let after = command(&dir, Operation::BalanceSummary)?["notes"]
+        .as_array()
+        .unwrap()
+        .len();
+    eprintln!("consolidate 32 inputs: {elapsed:?}, notes {before} -> {after}");
+    assert_eq!(after, 1);
+    Ok(())
+}
+
+#[test]
 fn consolidate_combines_multiple_notes_into_one() -> Result<()> {
     let node = Node::start()?;
     let temp = tempfile::tempdir()?;

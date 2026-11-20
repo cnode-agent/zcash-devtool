@@ -1076,16 +1076,30 @@ fn pay(
             transparent_output = Some((to, amount_zat));
         }
         Operation::Consolidate { max_inputs } => {
-            let mut selected = available_note_summaries(store, config, control, true)?;
-            selected.sort_by_key(|(_, value)| *value);
+            let mut available = available_note_summaries(store, config, control, true)?;
+            available.sort_by_key(|(_, value)| *value);
+            // Dust sweep: the smallest notes often cannot pay the fee alone.
+            // Add the largest note (replacing the largest of the small set) so
+            // a consolidation still removes a batch of dust instead of failing.
+            let largest = available.last().cloned();
+            let mut selected = available;
             selected.truncate(max_inputs);
             ensure!(
                 selected.len() >= 2,
                 "need at least two available notes to consolidate"
             );
-            let total = selected.iter().try_fold(0u64, |sum, (_, value)| {
+            let mut total = selected.iter().try_fold(0u64, |sum, (_, value)| {
                 sum.checked_add(*value).context("note total overflow")
             })?;
+            if total <= FEE {
+                if let Some(large) = largest {
+                    selected.pop();
+                    selected.push(large);
+                }
+                total = selected.iter().try_fold(0u64, |sum, (_, value)| {
+                    sum.checked_add(*value).context("note total overflow")
+                })?;
+            }
             let amount = total
                 .checked_sub(FEE)
                 .context("notes cannot pay the consolidation fee")?;
